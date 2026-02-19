@@ -23,6 +23,10 @@ from rdkit.Chem import Descriptors, AllChem
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import pearsonr, spearmanr
+import matplotlib.pyplot as plt
+import seaborn as sns
+import argparse
 
 
 # Configuration
@@ -201,6 +205,169 @@ def define_binding_site(protein_pdb: str, ligand_mol2: str) -> Tuple[Tuple[float
            (float(size[0]), float(size[1]), float(size[2]))
 
 
+def extract_pose_coordinates(pdbqt_file: Path) -> List[np.ndarray]:
+    """
+    Extract atom coordinates for each pose from Vina PDBQT output.
+    
+    Args:
+        pdbqt_file: Path to Vina output PDBQT file
+    
+    Returns:
+        List of numpy arrays, one per pose, containing heavy atom coordinates
+    """
+    poses = []
+    current_pose_atoms = []
+    
+    with open(pdbqt_file, 'r') as f:
+        for line in f:
+            line = line.rstrip()
+            
+            # New pose starts with MODEL
+            if line.startswith('MODEL'):
+                current_pose_atoms = []
+            
+            # End of pose
+            elif line.startswith('ENDMDL'):
+                if current_pose_atoms:
+                    poses.append(np.array(current_pose_atoms))
+                    current_pose_atoms = []
+            
+            # Atom line - extract coordinates for heavy atoms only
+            elif line.startswith('ATOM') or line.startswith('HETATM'):
+                # Check if it's a heavy atom (not hydrogen)
+                atom_name = line[12:16].strip()
+                if not atom_name.startswith('H'):
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        current_pose_atoms.append([x, y, z])
+                    except (ValueError, IndexError):
+                        continue
+    
+    # Add last pose if file doesn't end with ENDMDL
+    if current_pose_atoms:
+        poses.append(np.array(current_pose_atoms))
+    
+    return poses
+
+
+def extract_crystal_ligand_coords(pdb_code: str) -> Optional[np.ndarray]:
+    """
+    Extract heavy atom coordinates from crystal structure ligand.
+    
+    Args:
+        pdb_code: PDB code of the complex
+    
+    Returns:
+        Numpy array of heavy atom coordinates, or None if failed
+    """
+    try:
+        pdb_dir = get_complex_path(pdb_code)
+        ligand_mol2 = pdb_dir / f"{pdb_code}_ligand.mol2"
+        
+        if not ligand_mol2.exists():
+            return None
+        
+        mol = Chem.MolFromMol2File(str(ligand_mol2))
+        if mol is None:
+            return None
+        
+        conf = mol.GetConformer()
+        coords = []
+        
+        for atom in mol.GetAtoms():
+            # Skip hydrogens
+            if atom.GetAtomicNum() == 1:
+                continue
+            pos = conf.GetAtomPosition(atom.GetIdx())
+            coords.append([pos.x, pos.y, pos.z])
+        
+        return np.array(coords)
+    except Exception as e:
+        print(f"Warning: Could not extract crystal coordinates for {pdb_code}: {e}")
+        return None
+
+
+def calculate_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
+    """
+    Calculate RMSD between two sets of coordinates using Kabsch algorithm.
+    
+    Args:
+        coords1: First set of coordinates (reference)
+        coords2: Second set of coordinates (mobile)
+    
+    Returns:
+        RMSD value
+    """
+    if coords1.shape != coords2.shape:
+        print(f"Warning: Coordinate shape mismatch: {coords1.shape} vs {coords2.shape}")
+        return float('inf')
+    
+    # Center the coordinates
+    centroid1 = np.mean(coords1, axis=0)
+    centroid2 = np.mean(coords2, axis=0)
+    
+    centered1 = coords1 - centroid1
+    centered2 = coords2 - centroid2
+    
+    # Calculate covariance matrix
+    covariance_matrix = np.dot(centered2.T, centered1)
+    
+    # SVD
+    V, S, Wt = np.linalg.svd(covariance_matrix)
+    
+    # Calculate rotation matrix
+    d = np.linalg.det(np.dot(V, Wt))
+    if d < 0:
+        V[:, -1] = -V[:, -1]
+    
+    rotation_matrix = np.dot(V, Wt)
+    
+    # Rotate coords2
+    rotated_coords2 = np.dot(centered2, rotation_matrix)
+    
+    # Calculate RMSD
+    rmsd = np.sqrt(np.mean(np.sum((centered1 - rotated_coords2) ** 2, axis=1)))
+    
+    return rmsd
+
+
+def calculate_all_pose_rmsds(vina_result: Dict, pdb_code: str) -> Optional[List[float]]:
+    """
+    Calculate RMSD between each Vina pose and crystal structure.
+    
+    Args:
+        vina_result: Dictionary from run_vina()
+        pdb_code: PDB code of the complex
+    
+    Returns:
+        List of RMSD values for each pose, or None if failed
+    """
+    # Get crystal structure coordinates
+    crystal_coords = extract_crystal_ligand_coords(pdb_code)
+    if crystal_coords is None:
+        return None
+    
+    # Get pose coordinates
+    pose_coords = vina_result.get('pose_coordinates', [])
+    if not pose_coords:
+        return None
+    
+    # Check if atom counts match
+    if crystal_coords.shape[0] != pose_coords[0].shape[0]:
+        print(f"Warning: Atom count mismatch for {pdb_code}: crystal={crystal_coords.shape[0]}, pose={pose_coords[0].shape[0]}")
+        return None
+    
+    # Calculate RMSD for each pose
+    rmsds = []
+    for pose in pose_coords:
+        rmsd = calculate_rmsd(crystal_coords, pose)
+        rmsds.append(rmsd)
+    
+    return rmsds
+
+
 def run_vina(pdb_code: str) -> Optional[Dict]:
     """
     Run AutoDock Vina on a single complex.
@@ -209,7 +376,7 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
         pdb_code: PDB code of the complex
     
     Returns:
-        Dictionary with docking results, or None if failed
+        Dictionary with docking results including pose coordinates, or None if failed
     """
     try:
         pdb_dir = get_complex_path(pdb_code)
@@ -237,7 +404,6 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
     vina_output = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
     
     # Prepare receptor (convert PDB to PDBQT using Open Babel)
-    # Use -xr to create rigid receptor without torsion tree
     prepare_receptor = subprocess.run(
         ['obabel', '-ipdb', str(protein_pdb), '-opdbqt', '-O', str(vina_input), 
          '-xr', '--partialcharge', 'gasteiger'],
@@ -283,7 +449,7 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
         print(f"Warning: Vina failed for {pdb_code}: {result.stderr}")
         return None
     
-    # Parse Vina output
+    # Parse Vina output for scores
     scores = []
     with open(vina_output, 'r') as f:
         for line in f:
@@ -297,9 +463,17 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
         print(f"Warning: No poses generated for {pdb_code}")
         return None
     
+    # Extract pose coordinates
+    pose_coords = extract_pose_coordinates(vina_output)
+    
+    if len(pose_coords) != len(scores):
+        print(f"Warning: Mismatch between number of scores ({len(scores)}) and poses ({len(pose_coords)}) for {pdb_code}")
+        return None
+    
     return {
         'pdb_code': pdb_code,
         'scores': scores,
+        'pose_coordinates': pose_coords,
         'top_score': scores[0],
         'center': center,
         'size': size
@@ -342,102 +516,134 @@ def extract_rdkit_features(ligand_mol2: str) -> Optional[Dict]:
         return None
 
 
-def extract_vina_features(vina_result: Dict) -> Dict:
+def extract_pose_features(vina_result: Dict, pose_idx: int, rmsd: float) -> Dict:
     """
-    Extract features from Vina docking results.
+    Extract features for a specific pose from Vina docking results.
     
     Args:
         vina_result: Dictionary from run_vina()
+        pose_idx: Index of the pose (0-based)
+        rmsd: RMSD of this pose to crystal structure
     
     Returns:
-        Dictionary of Vina-derived features
+        Dictionary of pose-level features
     """
     scores = vina_result['scores']
+    num_poses = len(scores)
+    
+    # Get the score for this specific pose
+    pose_score = scores[pose_idx]
+    
+    # Calculate relative features
+    score_rank = pose_idx + 1  # 1-based rank
+    score_diff_from_best = pose_score - scores[0]
+    score_diff_from_worst = scores[-1] - pose_score
+    score_percentile = (num_poses - score_rank) / num_poses
+    
+    # Calculate score statistics relative to all poses
+    score_mean = np.mean(scores)
+    score_std = np.std(scores)
+    score_zscore = (pose_score - score_mean) / (score_std + 1e-8)
     
     return {
-        'vina_top_score': scores[0],
-        'vina_mean_score': np.mean(scores),
-        'vina_std_score': np.std(scores),
+        'vina_score': pose_score,
+        'vina_rank': score_rank,
+        'vina_score_diff_best': score_diff_from_best,
+        'vina_score_diff_worst': score_diff_from_worst,
+        'vina_score_percentile': score_percentile,
+        'vina_score_zscore': score_zscore,
+        'vina_num_poses': num_poses,
         'vina_score_range': scores[0] - scores[-1],
-        'vina_num_poses': len(scores)
+        'rmsd': rmsd
     }
 
 
-def prepare_training_data(binding_data: pd.DataFrame, 
-                         vina_results: List[Dict],
-                         rdkit_features: Dict[str, Dict],
-                         protein_features: Dict[str, Dict]) -> pd.DataFrame:
+def prepare_training_data(vina_results: List[Dict]) -> pd.DataFrame:
     """
-    Prepare combined feature matrix for training.
+    Prepare pose-level feature matrix for training.
+    Each pose becomes a training example with binary target (1=best pose, 0=other).
     
     Args:
-        binding_data: DataFrame with binding affinities
-        vina_results: List of Vina docking results
-        rdkit_features: Dictionary of RDKit features per PDB code
-        protein_features: Dictionary of protein features per PDB code
+        vina_results: List of Vina docking results with RMSD values
     
     Returns:
-        DataFrame with all features for training
+        DataFrame with pose-level features and binary target
     """
     records = []
     
     for result in vina_results:
         pdb_code = result['pdb_code']
+        scores = result['scores']
         
-        # Get binding affinity
-        binding_row = binding_data[binding_data['pdb_code'] == pdb_code]
-        if len(binding_row) == 0:
+        # Calculate RMSDs for all poses
+        rmsds = calculate_all_pose_rmsds(result, pdb_code)
+        if rmsds is None:
+            print(f"Warning: Could not calculate RMSDs for {pdb_code}, skipping")
             continue
         
-        affinity_nM = binding_row['affinity_nM'].values[0]
+        if len(rmsds) != len(scores):
+            print(f"Warning: RMSD/score count mismatch for {pdb_code}, skipping")
+            continue
         
-        # Get features
-        rdkit = rdkit_features.get(pdb_code, {})
-        vina = extract_vina_features(result)
-        protein = protein_features.get(pdb_code, {})
+        # Find the best pose (lowest RMSD)
+        best_pose_idx = np.argmin(rmsds)
         
-        # Combine all features
-        record = {
-            'pdb_code': pdb_code,
-            'affinity_nM': affinity_nM,
-            'log_affinity': np.log10(affinity_nM + 1)
-        }
-        record.update(rdkit)
-        record.update(vina)
-        record.update(protein)
-        
-        records.append(record)
+        # Create a record for each pose
+        for pose_idx in range(len(scores)):
+            # Extract features for this pose
+            features = extract_pose_features(result, pose_idx, rmsds[pose_idx])
+            
+            # Binary target: 1 if this is the best pose, 0 otherwise
+            is_best_pose = 1 if pose_idx == best_pose_idx else 0
+            
+            record = {
+                'pdb_code': pdb_code,
+                'pose_idx': pose_idx,
+                'is_best_pose': is_best_pose,
+                'rmsd': rmsds[pose_idx]
+            }
+            record.update(features)
+            
+            records.append(record)
     
     return pd.DataFrame(records)
 
 
-def train_rescoring_model(train_df: pd.DataFrame) -> xgb.XGBRegressor:
+def train_rescoring_model(train_df: pd.DataFrame) -> xgb.XGBClassifier:
     """
-    Train XGBoost model for pose rescoring.
+    Train XGBoost classifier to predict if a pose is the best (lowest RMSD).
     
     Args:
-        train_df: DataFrame with features and binding affinities
+        train_df: DataFrame with pose-level features and is_best_pose target
     
     Returns:
-        Trained XGBoost model
+        Trained XGBoost classifier
     """
     # Define feature columns (exclude identifiers and targets)
     feature_cols = [col for col in train_df.columns 
-                   if col not in ['pdb_code', 'affinity_nM', 'log_affinity']]
+                   if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
     
     X = train_df[feature_cols].values
-    y = train_df['log_affinity'].values
+    y = train_df['is_best_pose'].values
     
     # Handle missing values
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Train model
-    model = xgb.XGBRegressor(
+    # Calculate scale_pos_weight to handle class imbalance
+    # (most poses are not the best pose)
+    num_positives = np.sum(y == 1)
+    num_negatives = np.sum(y == 0)
+    scale_pos_weight = num_negatives / num_positives if num_positives > 0 else 1.0
+    
+    # Train classifier
+    model = xgb.XGBClassifier(
         n_estimators=100,
         max_depth=6,
         learning_rate=0.1,
         random_state=RANDOM_SEED,
-        n_jobs=-1
+        n_jobs=-1,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric='logloss'
     )
     
     model.fit(X, y)
@@ -445,39 +651,409 @@ def train_rescoring_model(train_df: pd.DataFrame) -> xgb.XGBRegressor:
     return model
 
 
-def evaluate_model(model: xgb.XGBRegressor, test_df: pd.DataFrame) -> Dict:
+def evaluate_model(model: xgb.XGBClassifier, test_df: pd.DataFrame) -> Dict:
     """
-    Evaluate trained model on test set.
+    Evaluate trained classifier on test set for pose selection.
     
     Args:
-        model: Trained XGBoost model
+        model: Trained XGBoost classifier
         test_df: DataFrame with test features
     
     Returns:
-        Dictionary of evaluation metrics
+        Dictionary of evaluation metrics including success rate
     """
     feature_cols = [col for col in test_df.columns 
-                   if col not in ['pdb_code', 'affinity_nM', 'log_affinity']]
+                   if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
     
     X_test = test_df[feature_cols].values
-    y_test = test_df['log_affinity'].values
+    y_test = test_df['is_best_pose'].values
     X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
     
-    y_pred = model.predict(X_test)
+    # Get prediction probabilities
+    y_proba = model.predict_proba(X_test)[:, 1]  # Probability of being best pose
     
-    mse = mean_squared_error(y_test, y_pred)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(y_test, y_pred)
+    # Group by complex to evaluate pose selection per complex
+    test_df_copy = test_df.copy()
+    test_df_copy['predicted_proba'] = y_proba
+    
+    # Calculate success rate
+    vina_success = 0
+    xgb_success = 0
+    total_complexes = 0
+    
+    # Track RMSD of selected poses
+    vina_selected_rmsds = []
+    xgb_selected_rmsds = []
+    
+    for pdb_code in test_df_copy['pdb_code'].unique():
+        complex_df = test_df_copy[test_df_copy['pdb_code'] == pdb_code]
+        
+        if len(complex_df) == 0:
+            continue
+        
+        total_complexes += 1
+        
+        # Find the actual best pose (lowest RMSD)
+        actual_best_idx = complex_df['rmsd'].idxmin()
+        
+        # Vina's choice: lowest score (rank 1)
+        vina_best_idx = complex_df['vina_rank'].idxmin()
+        vina_selected_rmsds.append(complex_df.loc[vina_best_idx, 'rmsd'])
+        
+        # XGBoost's choice: highest probability
+        xgb_best_idx = complex_df['predicted_proba'].idxmax()
+        xgb_selected_rmsds.append(complex_df.loc[xgb_best_idx, 'rmsd'])
+        
+        # Check if they selected the actual best pose
+        if vina_best_idx == actual_best_idx:
+            vina_success += 1
+        if xgb_best_idx == actual_best_idx:
+            xgb_success += 1
+    
+    # Calculate metrics
+    vina_success_rate = vina_success / total_complexes if total_complexes > 0 else 0
+    xgb_success_rate = xgb_success / total_complexes if total_complexes > 0 else 0
+    
+    mean_vina_rmsd = np.mean(vina_selected_rmsds) if vina_selected_rmsds else 0
+    mean_xgb_rmsd = np.mean(xgb_selected_rmsds) if xgb_selected_rmsds else 0
     
     return {
-        'rmse': rmse,
-        'r2': r2,
-        'y_test': y_test,
-        'y_pred': y_pred
+        'total_complexes': total_complexes,
+        'vina_success_rate': vina_success_rate,
+        'xgb_success_rate': xgb_success_rate,
+        'vina_success_count': vina_success,
+        'xgb_success_count': xgb_success,
+        'mean_vina_rmsd': mean_vina_rmsd,
+        'mean_xgb_rmsd': mean_xgb_rmsd,
+        'vina_selected_rmsds': vina_selected_rmsds,
+        'xgb_selected_rmsds': xgb_selected_rmsds,
+        'test_df': test_df_copy
     }
 
 
-def process_all_complexes(num_complexes: Optional[int] = None) -> Tuple[pd.DataFrame, List[Dict], Dict, Dict]:
+def plot_rmsd_distribution_comparison(metrics: Dict, output_dir: Path) -> None:
+    """
+    Plot 1: RMSD distribution comparison between Vina and XGBoost selected poses.
+    
+    Args:
+        metrics: Dictionary from evaluate_model()
+        output_dir: Directory to save plots
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Histogram comparison
+    ax = axes[0]
+    bins = np.linspace(0, max(max(metrics['vina_selected_rmsds']), max(metrics['xgb_selected_rmsds'])) + 0.5, 20)
+    ax.hist(metrics['vina_selected_rmsds'], bins=bins, alpha=0.6, label=f'Vina (mean={metrics["mean_vina_rmsd"]:.2f}Å)', color='orange')
+    ax.hist(metrics['xgb_selected_rmsds'], bins=bins, alpha=0.6, label=f'XGBoost (mean={metrics["mean_xgb_rmsd"]:.2f}Å)', color='green')
+    ax.set_xlabel('RMSD to Crystal Structure (Å)', fontsize=12)
+    ax.set_ylabel('Number of Complexes', fontsize=12)
+    ax.set_title('RMSD Distribution of Selected Poses', fontsize=12)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Box plot comparison
+    ax = axes[1]
+    data = [metrics['vina_selected_rmsds'], metrics['xgb_selected_rmsds']]
+    bp = ax.boxplot(data, labels=['Vina', 'XGBoost'], patch_artist=True)
+    bp['boxes'][0].set_facecolor('orange')
+    bp['boxes'][1].set_facecolor('green')
+    ax.set_ylabel('RMSD to Crystal Structure (Å)', fontsize=12)
+    ax.set_title('RMSD Comparison (Box Plot)', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'rmsd_distribution_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved RMSD distribution comparison to {output_dir / 'rmsd_distribution_comparison.png'}")
+
+
+def plot_success_rate_by_rank(metrics: Dict, test_df: pd.DataFrame, output_dir: Path) -> None:
+    """
+    Plot 2: Success rate breakdown by which Vina rank was actually best.
+    
+    Args:
+        metrics: Dictionary from evaluate_model()
+        test_df: DataFrame with test data including predicted_proba
+        output_dir: Directory to save plots
+    """
+    # Count which Vina rank was actually best for each complex
+    vina_rank_success = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    xgb_rank_success = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    
+    for pdb_code in test_df['pdb_code'].unique():
+        complex_df = test_df[test_df['pdb_code'] == pdb_code]
+        
+        # Find which rank was actually best
+        best_rank = complex_df.loc[complex_df['rmsd'].idxmin(), 'vina_rank']
+        vina_rank_success[best_rank] += 1
+        
+        # Find which rank XGBoost selected
+        xgb_best_idx = complex_df['predicted_proba'].idxmax()
+        xgb_rank = complex_df.loc[xgb_best_idx, 'vina_rank']
+        xgb_rank_success[xgb_rank] += 1
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    ranks = [1, 2, 3, 4, 5]
+    vina_counts = [vina_rank_success[r] for r in ranks]
+    xgb_counts = [xgb_rank_success[r] for r in ranks]
+    
+    x = np.arange(len(ranks))
+    width = 0.35
+    
+    ax.bar(x - width/2, vina_counts, width, label='Vina Selected', color='orange', alpha=0.8)
+    ax.bar(x + width/2, xgb_counts, width, label='XGBoost Selected', color='green', alpha=0.8)
+    
+    ax.set_xlabel('Vina Rank of Selected Pose', fontsize=12)
+    ax.set_ylabel('Number of Complexes', fontsize=12)
+    ax.set_title('Which Vina Rank Was Selected by Each Method', fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Rank {r}' for r in ranks])
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'success_rate_by_rank.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved success rate by rank to {output_dir / 'success_rate_by_rank.png'}")
+
+
+def plot_feature_importance(model: xgb.XGBClassifier, feature_names: List[str], output_dir: Path) -> None:
+    """
+    Plot 3: Feature importance from XGBoost model.
+    
+    Args:
+        model: Trained XGBoost classifier
+        feature_names: List of feature names
+        output_dir: Directory to save plots
+    """
+    importance = model.feature_importances_
+    indices = np.argsort(importance)[::-1]
+    
+    # Top 15 features
+    top_n = min(15, len(feature_names))
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    y_pos = np.arange(top_n)
+    ax.barh(y_pos, importance[indices[:top_n]], color='steelblue', alpha=0.8)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([feature_names[i] for i in indices[:top_n]])
+    ax.invert_yaxis()
+    ax.set_xlabel('Feature Importance', fontsize=12)
+    ax.set_title('Top 15 Most Important Features (XGBoost)', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'feature_importance.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved feature importance plot to {output_dir / 'feature_importance.png'}")
+
+
+def plot_roc_curve(test_df: pd.DataFrame, model: xgb.XGBClassifier, output_dir: Path) -> None:
+    """
+    Plot 4: ROC curve for binary classification (predicting best pose).
+    
+    Args:
+        test_df: DataFrame with test data
+        model: Trained XGBoost classifier
+        output_dir: Directory to save plots
+    """
+    from sklearn.metrics import roc_curve, auc
+    
+    feature_cols = [col for col in test_df.columns 
+                   if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
+    
+    X_test = test_df[feature_cols].values
+    y_test = test_df['is_best_pose'].values
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    fpr, tpr, _ = roc_curve(y_test, y_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+    ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random classifier')
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title('ROC Curve: Predicting Best Pose', fontsize=12)
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'roc_curve.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved ROC curve to {output_dir / 'roc_curve.png'}")
+
+
+def plot_precision_recall_curve(test_df: pd.DataFrame, model: xgb.XGBClassifier, output_dir: Path) -> None:
+    """
+    Plot 5: Precision-Recall curve for binary classification.
+    
+    Args:
+        test_df: DataFrame with test data
+        model: Trained XGBoost classifier
+        output_dir: Directory to save plots
+    """
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    
+    feature_cols = [col for col in test_df.columns 
+                   if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
+    
+    X_test = test_df[feature_cols].values
+    y_test = test_df['is_best_pose'].values
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    precision, recall, _ = precision_recall_curve(y_test, y_proba)
+    avg_precision = average_precision_score(y_test, y_proba)
+    
+    # Calculate baseline (random classifier)
+    baseline = np.sum(y_test) / len(y_test)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    ax.plot(recall, precision, color='blue', lw=2, label=f'PR curve (AP = {avg_precision:.3f})')
+    ax.axhline(y=baseline, color='red', linestyle='--', label=f'Baseline (random = {baseline:.3f})')
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title('Precision-Recall Curve: Predicting Best Pose', fontsize=12)
+    ax.legend(loc='lower left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'precision_recall_curve.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved precision-recall curve to {output_dir / 'precision_recall_curve.png'}")
+
+
+def plot_rmsd_vs_probability(test_df: pd.DataFrame, output_dir: Path) -> None:
+    """
+    Plot 6: RMSD vs XGBoost probability scatter plot.
+    
+    Args:
+        test_df: DataFrame with test data including predicted_proba
+        output_dir: Directory to save plots
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Color by whether it's the best pose
+    best_poses = test_df[test_df['is_best_pose'] == 1]
+    other_poses = test_df[test_df['is_best_pose'] == 0]
+    
+    ax.scatter(other_poses['predicted_proba'], other_poses['rmsd'], 
+              alpha=0.5, s=50, color='gray', label='Other poses')
+    ax.scatter(best_poses['predicted_proba'], best_poses['rmsd'], 
+              alpha=0.8, s=80, color='red', label='Best pose (lowest RMSD)')
+    
+    ax.set_xlabel('XGBoost Probability (of being best pose)', fontsize=12)
+    ax.set_ylabel('RMSD to Crystal Structure (Å)', fontsize=12)
+    ax.set_title('XGBoost Confidence vs Actual RMSD', fontsize=12)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'rmsd_vs_probability.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved RMSD vs probability plot to {output_dir / 'rmsd_vs_probability.png'}")
+
+
+def export_pose_scores_csv(test_df: pd.DataFrame, vina_results: List[Dict], output_dir: Path) -> None:
+    """
+    Export compact CSV with all pose scores and predictions per complex.
+    
+    Args:
+        test_df: DataFrame with test data including predictions
+        vina_results: List of Vina results with affinity data
+        output_dir: Directory to save CSV
+    """
+    records = []
+    
+    # Create a mapping from pdb_code to affinity
+    affinity_map = {}
+    for result in vina_results:
+        if 'affinity_nM' in result:
+            affinity_map[result['pdb_code']] = result['affinity_nM']
+    
+    for pdb_code in test_df['pdb_code'].unique():
+        complex_df = test_df[test_df['pdb_code'] == pdb_code].sort_values('pose_idx')
+        
+        record = {
+            'pdb_code': pdb_code,
+            'affinity_nM': affinity_map.get(pdb_code, None),
+            'log_affinity': np.log10(affinity_map.get(pdb_code, 0) + 1) if affinity_map.get(pdb_code) else None
+        }
+        
+        # Add scores and predictions for each pose
+        for _, row in complex_df.iterrows():
+            pose_idx = int(row['pose_idx'])
+            record[f'pose_{pose_idx}_vina_score'] = row['vina_score']
+            record[f'pose_{pose_idx}_vina_rank'] = int(row['vina_rank'])
+            record[f'pose_{pose_idx}_rmsd'] = row['rmsd']
+            record[f'pose_{pose_idx}_xgb_probability'] = row['predicted_proba']
+            record[f'pose_{pose_idx}_is_best'] = int(row['is_best_pose'])
+            
+            # Add feature values for this pose
+            for col in complex_df.columns:
+                if col.startswith('vina_') and col not in ['vina_score', 'vina_rank']:
+                    record[f'pose_{pose_idx}_{col}'] = row[col]
+        
+        # Add summary columns
+        best_pose_idx = complex_df.loc[complex_df['rmsd'].idxmin(), 'pose_idx']
+        vina_selected_idx = complex_df.loc[complex_df['vina_rank'].idxmin(), 'pose_idx']
+        xgb_selected_idx = complex_df.loc[complex_df['predicted_proba'].idxmax(), 'pose_idx']
+        
+        record['actual_best_pose_idx'] = int(best_pose_idx)
+        record['vina_selected_pose_idx'] = int(vina_selected_idx)
+        record['xgb_selected_pose_idx'] = int(xgb_selected_idx)
+        record['vina_selected_rmsd'] = complex_df.loc[complex_df['vina_rank'].idxmin(), 'rmsd']
+        record['xgb_selected_rmsd'] = complex_df.loc[complex_df['predicted_proba'].idxmax(), 'rmsd']
+        record['vina_correct'] = 1 if vina_selected_idx == best_pose_idx else 0
+        record['xgb_correct'] = 1 if xgb_selected_idx == best_pose_idx else 0
+        
+        records.append(record)
+    
+    df = pd.DataFrame(records)
+    output_file = output_dir / 'pose_scores_detailed.csv'
+    df.to_csv(output_file, index=False)
+    print(f"Saved detailed pose scores to {output_file}")
+    print(f"  Total complexes: {len(df)}")
+    print(f"  Vina accuracy: {df['vina_correct'].mean():.3f}")
+    print(f"  XGBoost accuracy: {df['xgb_correct'].mean():.3f}")
+
+def load_data_from_csv(train_csv: Path, test_csv: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load existing training and test data from CSV files.
+    
+    Args:
+        train_csv: Path to training data CSV
+        test_csv: Path to test data CSV
+    
+    Returns:
+        Tuple of (train_df, test_df)
+    """
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Training CSV not found: {train_csv}")
+    if not test_csv.exists():
+        raise FileNotFoundError(f"Test CSV not found: {test_csv}")
+    
+    train_df = pd.read_csv(train_csv)
+    test_df = pd.read_csv(test_csv)
+    
+    print(f"Loaded training data: {train_df.shape}")
+    print(f"Loaded test data: {test_df.shape}")
+    
+    return train_df, test_df
+
+
+def process_all_complexes(num_complexes: Optional[int] = None) -> List[Dict]:
     """
     Process all complexes and run Vina docking.
     
@@ -485,7 +1061,7 @@ def process_all_complexes(num_complexes: Optional[int] = None) -> Tuple[pd.DataF
         num_complexes: Limit number of complexes (None for all)
     
     Returns:
-        Tuple of (binding_data, vina_results, rdkit_features, protein_features)
+        List of Vina results with pose coordinates and RMSDs
     """
     print("Loading binding data...")
     binding_data = load_binding_data()
@@ -499,75 +1075,185 @@ def process_all_complexes(num_complexes: Optional[int] = None) -> Tuple[pd.DataF
         complexes = complexes[:num_complexes]
     
     vina_results = []
-    rdkit_features = {}
-    protein_features = {}
     
     for i, pdb_code in enumerate(complexes):
         print(f"Processing {pdb_code} ({i+1}/{len(complexes)})...")
         
+        # Check if complex has binding data
+        binding_row = binding_data[binding_data['pdb_code'] == pdb_code]
+        if len(binding_row) == 0:
+            print(f"  No binding data for {pdb_code}, skipping")
+            continue
+        
         # Run Vina
         vina_result = run_vina(pdb_code)
         if vina_result:
-            vina_results.append(vina_result)
-        
-        # Extract RDKit features
-        try:
-            pdb_dir = get_complex_path(pdb_code)
-            ligand_file = pdb_dir / f"{pdb_code}_ligand.mol2"
-            if ligand_file.exists():
-                features = extract_rdkit_features(str(ligand_file))
-                if features:
-                    rdkit_features[pdb_code] = features
-        except FileNotFoundError:
-            pass
+            # Calculate RMSDs
+            rmsds = calculate_all_pose_rmsds(vina_result, pdb_code)
+            if rmsds is not None:
+                vina_result['rmsds'] = rmsds
+                vina_result['affinity_nM'] = binding_row['affinity_nM'].values[0]
+                vina_results.append(vina_result)
+            else:
+                print(f"  Could not calculate RMSDs for {pdb_code}, skipping")
     
-    return binding_data, vina_results, rdkit_features, protein_features
+    return vina_results
 
 
 def main():
     """
-    Main function to run the complete workflow.
+    Main function to run the complete pose rescoring workflow.
     """
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Process PDBbind dataset for molecular docking pose rescoring with XGBoost'
+    )
+    parser.add_argument(
+        '--load-csv', 
+        nargs=2, 
+        metavar=('TRAIN_CSV', 'TEST_CSV'),
+        help='Load existing training and test CSV files instead of running Vina'
+    )
+    parser.add_argument(
+        '--num-complexes', 
+        type=int, 
+        default=10,
+        help='Number of complexes to process (default: 10)'
+    )
+    parser.add_argument(
+        '--no-plots',
+        action='store_true',
+        help='Skip generating analysis plots'
+    )
+    args = parser.parse_args()
+    
     # Create output directory
     OUTPUT_DIR.mkdir(exist_ok=True)
     
-    # Process complexes
-    num_complexes = 10  # Start with small number for testing
-    binding_data, vina_results, rdkit_features, protein_features = \
-        process_all_complexes(num_complexes)
-    
-    print(f"\nProcessed {len(vina_results)} complexes successfully")
-    
-    # Prepare training data
-    print("Preparing training data...")
-    train_df = prepare_training_data(
-        binding_data, vina_results, rdkit_features, protein_features
-    )
-    print(f"Training data shape: {train_df.shape}")
-    
-    if len(train_df) < 10:
-        print("Not enough data for training")
-        return
-    
-    # Split data
-    train_df, test_df = train_test_split(
-        train_df, test_size=0.2, random_state=RANDOM_SEED
-    )
+    if args.load_csv:
+        # Load existing CSV files
+        print("Loading data from CSV files...")
+        train_csv = Path(args.load_csv[0])
+        test_csv = Path(args.load_csv[1])
+        train_df, test_df = load_data_from_csv(train_csv, test_csv)
+    else:
+        # Process complexes with Vina
+        num_complexes = args.num_complexes
+        vina_results = process_all_complexes(num_complexes)
+        
+        print(f"\nProcessed {len(vina_results)} complexes successfully")
+        
+        # Prepare training data
+        print("Preparing training data...")
+        train_df = prepare_training_data(vina_results)
+        print(f"Training data shape: {train_df.shape}")
+        
+        if len(train_df) < 10:
+            print("Not enough data for training")
+            return
+        
+        # Split data by complex (not by pose) to avoid data leakage
+        unique_complexes = train_df['pdb_code'].unique()
+        train_complexes, test_complexes = train_test_split(
+            unique_complexes, test_size=0.2, random_state=RANDOM_SEED
+        )
+        
+        train_df_final = train_df[train_df['pdb_code'].isin(train_complexes)]
+        test_df = train_df[train_df['pdb_code'].isin(test_complexes)]
+        
+        # Save results
+        train_df_final.to_csv(OUTPUT_DIR / "training_data.csv", index=False)
+        test_df.to_csv(OUTPUT_DIR / "test_data.csv", index=False)
+        print(f"Results saved to {OUTPUT_DIR}")
+        
+        train_df = train_df_final
     
     # Train model
-    print("Training XGBoost model...")
+    print("\nTraining XGBoost classifier...")
     model = train_rescoring_model(train_df)
     
     # Evaluate
-    print("Evaluating model...")
+    print("\nEvaluating model...")
     metrics = evaluate_model(model, test_df)
-    print(f"RMSE: {metrics['rmse']:.3f}")
-    print(f"R2: {metrics['r2']:.3f}")
     
-    # Save results
-    train_df.to_csv(OUTPUT_DIR / "training_data.csv", index=False)
-    test_df.to_csv(OUTPUT_DIR / "test_data.csv", index=False)
-    print(f"Results saved to {OUTPUT_DIR}")
+    print(f"\n{'='*60}")
+    print("POSE SELECTION PERFORMANCE")
+    print(f"{'='*60}")
+    print(f"Total test complexes: {metrics['total_complexes']}")
+    print(f"\nAutoDock Vina (baseline):")
+    print(f"  Success rate: {metrics['vina_success_rate']:.3f} ({metrics['vina_success_count']}/{metrics['total_complexes']})")
+    print(f"  Mean RMSD of selected poses: {metrics['mean_vina_rmsd']:.3f} Å")
+    print(f"\nXGBoost Rescoring Model:")
+    print(f"  Success rate: {metrics['xgb_success_rate']:.3f} ({metrics['xgb_success_count']}/{metrics['total_complexes']})")
+    print(f"  Mean RMSD of selected poses: {metrics['mean_xgb_rmsd']:.3f} Å")
+    
+    if metrics['xgb_success_rate'] > metrics['vina_success_rate']:
+        improvement = (metrics['xgb_success_rate'] - metrics['vina_success_rate']) * 100
+        print(f"\n✓ XGBoost improved success rate by {improvement:.1f} percentage points")
+    
+    # Save performance metrics
+    metrics_file = OUTPUT_DIR / 'pose_selection_metrics.txt'
+    with open(metrics_file, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("POSE SELECTION PERFORMANCE METRICS\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Total test complexes: {metrics['total_complexes']}\n\n")
+        f.write("AutoDock Vina (baseline):\n")
+        f.write(f"  Success rate: {metrics['vina_success_rate']:.3f} ({metrics['vina_success_count']}/{metrics['total_complexes']})\n")
+        f.write(f"  Mean RMSD: {metrics['mean_vina_rmsd']:.3f} Å\n\n")
+        f.write("XGBoost Rescoring Model:\n")
+        f.write(f"  Success rate: {metrics['xgb_success_rate']:.3f} ({metrics['xgb_success_count']}/{metrics['total_complexes']})\n")
+        f.write(f"  Mean RMSD: {metrics['mean_xgb_rmsd']:.3f} Å\n")
+    
+    print(f"\nSaved metrics to {metrics_file}")
+    
+    # Export detailed pose scores CSV
+    print("\nExporting detailed pose scores...")
+    if args.load_csv:
+        # If loading from CSV, we don't have vina_results, create empty list
+        vina_results_for_export = []
+    else:
+        # Get test complexes only
+        test_complexes_list = test_df['pdb_code'].unique()
+        vina_results_for_export = [vr for vr in vina_results if vr['pdb_code'] in test_complexes_list]
+    
+    export_pose_scores_csv(metrics['test_df'], vina_results_for_export, OUTPUT_DIR)
+    
+    # Generate plots
+    if not args.no_plots:
+        print("\nGenerating visualization plots...")
+        try:
+            # Get feature names for importance plot
+            feature_cols = [col for col in test_df.columns 
+                           if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
+            
+            # Plot 1: RMSD distribution comparison
+            plot_rmsd_distribution_comparison(metrics, OUTPUT_DIR)
+            
+            # Plot 2: Success rate by rank
+            plot_success_rate_by_rank(metrics, metrics['test_df'], OUTPUT_DIR)
+            
+            # Plot 3: Feature importance
+            plot_feature_importance(model, feature_cols, OUTPUT_DIR)
+            
+            # Plot 4: ROC curve
+            plot_roc_curve(test_df, model, OUTPUT_DIR)
+            
+            # Plot 5: Precision-Recall curve
+            plot_precision_recall_curve(test_df, model, OUTPUT_DIR)
+            
+            # Plot 6: RMSD vs probability
+            plot_rmsd_vs_probability(metrics['test_df'], OUTPUT_DIR)
+            
+            print("\nAll plots saved successfully!")
+        except Exception as e:
+            print(f"\nWarning: Could not generate some plots: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("\n" + "="*60)
+    print("Analysis complete!")
+    print("="*60)
 
 
 if __name__ == "__main__":

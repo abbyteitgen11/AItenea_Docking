@@ -1,7 +1,9 @@
 __pycache__/
 index/
+index_general/
 output/
 P-L/
+P-L_general/
 *.log
 *.tar.gz
 *.gz
@@ -14,4 +16,8 @@ P-L/
 *.log
 *.tar
 *.xlsx
+*.mol2
+*.sdf
+*.pdb
+*.pdbqt
 

@@ -24,6 +24,7 @@ import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
+from scipy.spatial import KDTree
 from scipy.stats import pearsonr, spearmanr
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -578,7 +579,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     kT = 0.592  # RT at 300K in kcal/mol (Vina scores in kcal/mol)
 
-    for pdb_code, group in df.groupby('pdb_code'):
+    for _, group in df.groupby('pdb_code'):
         idx = group.index
         scores = group['vina_score'].values
 
@@ -604,6 +605,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     new_df['gap_to_next_pose'] = gap_to_next
     new_df['top2_score_gap'] = top2_gaps
     new_df['log_abs_score'] = np.log(np.abs(df['vina_score']) + 1)
+
+    # Size-normalized Vina score (only when mol2 features have been added)
+    if 'num_heavy_atoms' in df.columns:
+        new_df['vina_score_per_atom'] = df['vina_score'] / (df['num_heavy_atoms'] + 1)
 
     return new_df
 
@@ -707,6 +712,152 @@ def augment_with_mol2_features(df: pd.DataFrame) -> pd.DataFrame:
 
     print(f"  Added {len(feat_names)} molecular features for "
           f"{len(mol2_cache)}/{df['pdb_code'].nunique()} complexes")
+    return new_df
+
+
+def load_protein_heavy_atom_coords(protein_pdb: Path) -> Optional[np.ndarray]:
+    """
+    Parse a protein PDB file and return heavy-atom (non-hydrogen) XYZ coordinates.
+
+    Args:
+        protein_pdb: Path to the protein PDB file
+
+    Returns:
+        numpy array of shape (N, 3), or None if parsing fails
+    """
+    coords = []
+    try:
+        with open(protein_pdb, 'r') as f:
+            for line in f:
+                if not (line.startswith('ATOM') or line.startswith('HETATM')):
+                    continue
+                # Atom name is in columns 12-16; element in cols 76-78 (may be absent)
+                atom_name = line[12:16].strip()
+                # Skip hydrogens by atom name (H, 1H, 2H, HD, HE, …)
+                if atom_name.startswith('H') or (len(atom_name) > 1 and atom_name[1] == 'H'):
+                    continue
+                # Also skip by element column if present
+                if len(line) >= 78:
+                    element = line[76:78].strip()
+                    if element.upper() == 'H':
+                        continue
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        print(f"    Warning: Could not parse protein PDB {protein_pdb}: {e}")
+        return None
+
+    if not coords:
+        return None
+    return np.array(coords, dtype=np.float32)
+
+
+def compute_pose_contact_features(ligand_coords: np.ndarray,
+                                   protein_tree: KDTree) -> Dict:
+    """
+    Compute protein–ligand contact features using a pre-built KDTree of protein atoms.
+
+    Args:
+        ligand_coords: (N_ligand, 3) array of ligand heavy-atom coordinates
+        protein_tree:  KDTree built from protein heavy-atom coordinates
+
+    Returns:
+        Dictionary of contact feature values
+    """
+    n_lig = len(ligand_coords)
+    if n_lig == 0:
+        return {k: np.nan for k in ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
+                                     'contact_min_dist', 'contact_score_lj',
+                                     'contact_buried_frac', 'contact_n_per_atom']}
+
+    # Count contacts at different radii
+    counts_5A = protein_tree.query_ball_point(ligand_coords, r=5.0, return_length=True)
+    counts_4A = protein_tree.query_ball_point(ligand_coords, r=4.0, return_length=True)
+    counts_3A = protein_tree.query_ball_point(ligand_coords, r=3.0, return_length=True)
+
+    n_5A = int(counts_5A.sum())
+    n_4A = int(counts_4A.sum())
+    n_3A = int(counts_3A.sum())
+
+    # Minimum protein–ligand distance
+    min_dists, _ = protein_tree.query(ligand_coords, k=1)
+    min_dist = float(min_dists.min())
+
+    # Approximate attractive LJ term: Σ (1/r^6), capped at r > 0.5 Å to avoid singularity
+    # Use nearest-neighbour distance for each ligand atom (fast approximation)
+    lj_score = float(np.sum(1.0 / np.maximum(min_dists, 0.5) ** 6))
+
+    # Fraction of ligand atoms "buried" (at least one protein atom within 4.5 Å)
+    counts_45A = protein_tree.query_ball_point(ligand_coords, r=4.5, return_length=True)
+    buried_frac = float((counts_45A > 0).sum() / n_lig)
+
+    return {
+        'contact_n_3A': n_3A,
+        'contact_n_4A': n_4A,
+        'contact_n_5A': n_5A,
+        'contact_min_dist': min_dist,
+        'contact_score_lj': lj_score,
+        'contact_buried_frac': buried_frac,
+        'contact_n_per_atom': n_4A / n_lig,
+    }
+
+
+def augment_with_contact_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add protein–ligand contact features by reading already-computed PDBQT output files
+    and the original protein PDB files.  Does NOT rerun Vina.
+
+    For each complex one KDTree is built from the protein heavy atoms and reused across
+    all 5 poses, keeping runtime to ~5–10 minutes for 5,300 complexes.
+
+    Args:
+        df: DataFrame with pdb_code and pose_idx columns
+
+    Returns:
+        DataFrame with additional contact feature columns (NaN where files missing)
+    """
+    contact_cols = ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
+                    'contact_min_dist', 'contact_score_lj',
+                    'contact_buried_frac', 'contact_n_per_atom']
+    new_df = df.copy()
+    for col in contact_cols:
+        new_df[col] = np.nan
+
+    found = 0
+    for pdb_code in df['pdb_code'].unique():
+        protein_pdb = STRUCTURES_DIR / pdb_code / f"{pdb_code}_protein.pdb"
+        pdbqt_file = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
+
+        if not protein_pdb.exists() or not pdbqt_file.exists():
+            continue
+
+        protein_coords = load_protein_heavy_atom_coords(protein_pdb)
+        if protein_coords is None or len(protein_coords) == 0:
+            continue
+
+        protein_tree = KDTree(protein_coords)
+
+        pose_coords_list = extract_pose_coordinates(pdbqt_file)
+        if not pose_coords_list:
+            continue
+
+        found += 1
+        complex_mask = new_df['pdb_code'] == pdb_code
+        for row_idx in new_df[complex_mask].index:
+            pose_idx = int(new_df.loc[row_idx, 'pose_idx'])
+            if pose_idx < len(pose_coords_list) and len(pose_coords_list[pose_idx]) > 0:
+                feats = compute_pose_contact_features(
+                    pose_coords_list[pose_idx].astype(np.float32), protein_tree
+                )
+                for col, val in feats.items():
+                    new_df.loc[row_idx, col] = val
+
+    print(f"  Added contact features for {found}/{df['pdb_code'].nunique()} complexes")
     return new_df
 
 
@@ -1029,6 +1180,12 @@ def evaluate_ranker(ranker: xgb.XGBRanker, test_df: pd.DataFrame,
     total_complexes = 0
     vina_selected_rmsds = []
     xgb_selected_rmsds = []
+    spearman_scores = []  # per-complex Spearman ρ(model_score, rmsd) — should be negative
+
+    # Multi-threshold accumulators
+    thresholds = [1.0, 1.5, 2.0, 2.5, 3.0]
+    vina_at_thresh = {t: 0 for t in thresholds}
+    xgb_at_thresh  = {t: 0 for t in thresholds}
 
     for pdb_code in test_df_copy['pdb_code'].unique():
         complex_df = test_df_copy[test_df_copy['pdb_code'] == pdb_code]
@@ -1041,7 +1198,7 @@ def evaluate_ranker(ranker: xgb.XGBRanker, test_df: pd.DataFrame,
         xgb_best_idx = complex_df['predicted_proba'].idxmax()
 
         vina_rmsd = complex_df.loc[vina_best_idx, 'rmsd']
-        xgb_rmsd = complex_df.loc[xgb_best_idx, 'rmsd']
+        xgb_rmsd  = complex_df.loc[xgb_best_idx,  'rmsd']
 
         vina_selected_rmsds.append(vina_rmsd)
         xgb_selected_rmsds.append(xgb_rmsd)
@@ -1051,25 +1208,161 @@ def evaluate_ranker(ranker: xgb.XGBRanker, test_df: pd.DataFrame,
         if xgb_best_idx == actual_best_idx:
             xgb_success += 1
 
-    vina_success_2A = sum(r < 2.0 for r in vina_selected_rmsds)
-    xgb_success_2A = sum(r < 2.0 for r in xgb_selected_rmsds)
+        for t in thresholds:
+            if vina_rmsd < t:
+                vina_at_thresh[t] += 1
+            if xgb_rmsd < t:
+                xgb_at_thresh[t] += 1
 
-    return {
+        # Per-complex Spearman correlation (model score vs RMSD)
+        if len(complex_df) >= 2:
+            rho, _ = spearmanr(complex_df['predicted_proba'].values, complex_df['rmsd'].values)
+            if not np.isnan(rho):
+                spearman_scores.append(rho)
+
+    n = total_complexes if total_complexes > 0 else 1
+    result = {
         'total_complexes': total_complexes,
-        'vina_success_rate': vina_success / total_complexes if total_complexes > 0 else 0,
-        'xgb_success_rate': xgb_success / total_complexes if total_complexes > 0 else 0,
+        'vina_success_rate': vina_success / n,
+        'xgb_success_rate':  xgb_success  / n,
+        'vina_success_count': vina_success,
+        'xgb_success_count':  xgb_success,
+        'mean_vina_rmsd': np.mean(vina_selected_rmsds) if vina_selected_rmsds else 0,
+        'mean_xgb_rmsd':  np.mean(xgb_selected_rmsds)  if xgb_selected_rmsds  else 0,
+        'median_vina_rmsd': float(np.median(vina_selected_rmsds)) if vina_selected_rmsds else 0,
+        'median_xgb_rmsd':  float(np.median(xgb_selected_rmsds))  if xgb_selected_rmsds  else 0,
+        'mean_rmsd_improvement': (np.mean(vina_selected_rmsds) - np.mean(xgb_selected_rmsds))
+                                  if vina_selected_rmsds else 0,
+        'spearman_mean': float(np.mean(spearman_scores)) if spearman_scores else 0,
+        'vina_selected_rmsds': vina_selected_rmsds,
+        'xgb_selected_rmsds':  xgb_selected_rmsds,
+        'test_df': test_df_copy,
+    }
+    # Add threshold-specific success rates
+    for t in thresholds:
+        key = str(t).replace('.', 'p')   # e.g. "2.0" -> "2p0"
+        result[f'vina_success_{key}A_rate']  = vina_at_thresh[t] / n
+        result[f'xgb_success_{key}A_rate']   = xgb_at_thresh[t]  / n
+        result[f'vina_success_{key}A_count'] = vina_at_thresh[t]
+        result[f'xgb_success_{key}A_count']  = xgb_at_thresh[t]
+
+    # Keep the 2Å keys that the rest of the code already references
+    result['vina_success_2A_rate']  = result['vina_success_2p0A_rate']
+    result['xgb_success_2A_rate']   = result['xgb_success_2p0A_rate']
+    result['vina_success_2A_count'] = result['vina_success_2p0A_count']
+    result['xgb_success_2A_count']  = result['xgb_success_2p0A_count']
+    return result
+
+
+def evaluate_ensemble(model_results: Dict, test_df: pd.DataFrame) -> Dict:
+    """
+    Build an ensemble by averaging per-complex min-max normalised scores from all rankers.
+    The ensemble does not require additional training; it combines the three already-evaluated
+    models to reduce variance.
+
+    Args:
+        model_results: Dict mapping model label -> evaluate_ranker() result dict
+        test_df: Original test DataFrame (without predictions)
+
+    Returns:
+        Metrics dict with the same keys as evaluate_ranker()
+    """
+    # Collect predicted_proba from each model's test_df (same row order)
+    norm_scores_list = []
+    for metrics in model_results.values():
+        scores = metrics['test_df']['predicted_proba'].values.astype(float)
+        lo, hi = scores.min(), scores.max()
+        norm_scores_list.append((scores - lo) / (hi - lo + 1e-10))
+
+    ensemble_scores = np.mean(norm_scores_list, axis=0)
+
+    # Build a combined test_df with the ensemble scores
+    combined_df = test_df.copy().reset_index(drop=True)
+    # Align with any model's test_df (they all share the same pdb_code/pose_idx order)
+    ref_df = next(iter(model_results.values()))['test_df'].reset_index(drop=True)
+    combined_df['predicted_proba'] = ensemble_scores
+
+    # Evaluate using the same logic as evaluate_ranker
+    vina_success = 0
+    xgb_success = 0
+    total_complexes = 0
+    vina_selected_rmsds = []
+    xgb_selected_rmsds = []
+    spearman_scores = []
+
+    thresholds = [1.0, 1.5, 2.0, 2.5, 3.0]
+    vina_at_thresh = {t: 0 for t in thresholds}
+    xgb_at_thresh  = {t: 0 for t in thresholds}
+
+    for pdb_code in ref_df['pdb_code'].unique():
+        mask = ref_df['pdb_code'] == pdb_code
+        complex_ref = ref_df[mask]
+        complex_scores = ensemble_scores[mask.values]
+
+        if len(complex_ref) == 0:
+            continue
+        total_complexes += 1
+
+        actual_best_idx = complex_ref['rmsd'].idxmin()
+        vina_best_idx = complex_ref['vina_rank'].idxmin()
+        xgb_best_local = np.argmax(complex_scores)
+        xgb_best_idx = complex_ref.index[xgb_best_local]
+
+        vina_rmsd = complex_ref.loc[vina_best_idx, 'rmsd']
+        xgb_rmsd = complex_ref.loc[xgb_best_idx, 'rmsd']
+
+        vina_selected_rmsds.append(vina_rmsd)
+        xgb_selected_rmsds.append(xgb_rmsd)
+
+        if vina_best_idx == actual_best_idx:
+            vina_success += 1
+        if xgb_best_idx == actual_best_idx:
+            xgb_success += 1
+
+        for t in thresholds:
+            if vina_rmsd < t:
+                vina_at_thresh[t] += 1
+            if xgb_rmsd < t:
+                xgb_at_thresh[t] += 1
+
+        if len(complex_ref) >= 2:
+            rho, _ = spearmanr(complex_scores, complex_ref['rmsd'].values)
+            if not np.isnan(rho):
+                spearman_scores.append(rho)
+
+    # Store ensemble scores back in combined_df for export / plots
+    combined_df = ref_df.copy()
+    combined_df['predicted_proba'] = ensemble_scores
+
+    n = total_complexes if total_complexes > 0 else 1
+    result = {
+        'total_complexes': total_complexes,
+        'vina_success_rate': vina_success / n,
+        'xgb_success_rate': xgb_success / n,
         'vina_success_count': vina_success,
         'xgb_success_count': xgb_success,
         'mean_vina_rmsd': np.mean(vina_selected_rmsds) if vina_selected_rmsds else 0,
         'mean_xgb_rmsd': np.mean(xgb_selected_rmsds) if xgb_selected_rmsds else 0,
-        'vina_success_2A_rate': vina_success_2A / total_complexes if total_complexes > 0 else 0,
-        'xgb_success_2A_rate': xgb_success_2A / total_complexes if total_complexes > 0 else 0,
-        'vina_success_2A_count': vina_success_2A,
-        'xgb_success_2A_count': xgb_success_2A,
+        'median_vina_rmsd': float(np.median(vina_selected_rmsds)) if vina_selected_rmsds else 0,
+        'median_xgb_rmsd': float(np.median(xgb_selected_rmsds)) if xgb_selected_rmsds else 0,
+        'mean_rmsd_improvement': (np.mean(vina_selected_rmsds) - np.mean(xgb_selected_rmsds))
+                                  if vina_selected_rmsds else 0,
+        'spearman_mean': float(np.mean(spearman_scores)) if spearman_scores else 0,
         'vina_selected_rmsds': vina_selected_rmsds,
         'xgb_selected_rmsds': xgb_selected_rmsds,
-        'test_df': test_df_copy,
+        'test_df': combined_df,
     }
+    for t in thresholds:
+        key = str(t).replace('.', 'p')
+        result[f'vina_success_{key}A_rate']  = vina_at_thresh[t] / n
+        result[f'xgb_success_{key}A_rate']   = xgb_at_thresh[t]  / n
+        result[f'vina_success_{key}A_count'] = vina_at_thresh[t]
+        result[f'xgb_success_{key}A_count']  = xgb_at_thresh[t]
+    result['vina_success_2A_rate']  = result['vina_success_2p0A_rate']
+    result['xgb_success_2A_rate']   = result['xgb_success_2p0A_rate']
+    result['vina_success_2A_count'] = result['vina_success_2p0A_count']
+    result['xgb_success_2A_count']  = result['xgb_success_2p0A_count']
+    return result
 
 
 def plot_rmsd_distribution_comparison(metrics: Dict, output_dir: Path) -> None:
@@ -1306,6 +1599,123 @@ def plot_rmsd_vs_probability(test_df: pd.DataFrame, output_dir: Path) -> None:
     print(f"Saved RMSD vs probability plot to {output_dir / 'rmsd_vs_probability.png'}")
 
 
+def plot_success_vs_rmsd_threshold(model_results: Dict, output_dir: Path) -> None:
+    """
+    Plot success rate (fraction of complexes with selected pose within threshold)
+    as a function of RMSD cutoff for each model and the Vina baseline.
+    This is the standard figure used to compare docking rescoring methods.
+
+    Args:
+        model_results: Dict mapping model label -> evaluate_ranker() result dict
+        output_dir: Directory to save the plot
+    """
+    thresholds = np.arange(0.25, 5.25, 0.25)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Vina baseline (same for all models — use first result)
+    first_metrics = next(iter(model_results.values()))
+    vina_rmsds = np.array(first_metrics['vina_selected_rmsds'])
+    vina_rates = [(vina_rmsds < t).mean() for t in thresholds]
+    ax.plot(thresholds, vina_rates, 'k--', lw=2, label='Vina (baseline)', zorder=5)
+
+    colors = plt.cm.tab10(np.linspace(0, 0.6, len(model_results)))
+    for (label, metrics), color in zip(model_results.items(), colors):
+        xgb_rmsds = np.array(metrics['xgb_selected_rmsds'])
+        rates = [(xgb_rmsds < t).mean() for t in thresholds]
+        ax.plot(thresholds, rates, lw=2, label=label, color=color)
+
+    ax.axvline(x=2.0, color='gray', linestyle=':', alpha=0.7, label='2 Å threshold')
+    ax.set_xlabel('RMSD Threshold (Å)', fontsize=12)
+    ax.set_ylabel('Fraction of Complexes with Pose within Threshold', fontsize=12)
+    ax.set_title('Pose Selection Success Rate vs RMSD Threshold', fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 5)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'success_vs_threshold.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved success-vs-threshold plot to {output_dir / 'success_vs_threshold.png'}")
+
+
+def plot_rmsd_cdf(model_results: Dict, output_dir: Path) -> None:
+    """
+    Plot empirical CDF of selected-pose RMSD for each model and the Vina baseline.
+    Curves that rise faster (more mass at low RMSD) indicate better rescoring.
+
+    Args:
+        model_results: Dict mapping model label -> evaluate_ranker() result dict
+        output_dir: Directory to save the plot
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    first_metrics = next(iter(model_results.values()))
+    vina_rmsds = np.sort(first_metrics['vina_selected_rmsds'])
+    y = np.arange(1, len(vina_rmsds) + 1) / len(vina_rmsds)
+    ax.plot(vina_rmsds, y, 'k--', lw=2, label='Vina (baseline)', zorder=5)
+
+    colors = plt.cm.tab10(np.linspace(0, 0.6, len(model_results)))
+    for (label, metrics), color in zip(model_results.items(), colors):
+        xgb_rmsds = np.sort(metrics['xgb_selected_rmsds'])
+        y = np.arange(1, len(xgb_rmsds) + 1) / len(xgb_rmsds)
+        ax.plot(xgb_rmsds, y, lw=2, label=label, color=color)
+
+    ax.axvline(x=2.0, color='gray', linestyle=':', alpha=0.7, label='2 Å threshold')
+    ax.set_xlabel('RMSD to Crystal Structure (Å)', fontsize=12)
+    ax.set_ylabel('Cumulative Fraction of Complexes', fontsize=12)
+    ax.set_title('CDF of Selected Pose RMSD', fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 8)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'rmsd_cdf.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved RMSD CDF plot to {output_dir / 'rmsd_cdf.png'}")
+
+
+def plot_spearman_per_complex(model_results: Dict, output_dir: Path) -> None:
+    """
+    For each test complex, compute the Spearman rank correlation between model score and
+    per-pose RMSD. A negative correlation means the model correctly ranks lower-RMSD poses
+    higher. Shown as overlapping histograms, one per model.
+
+    Args:
+        model_results: Dict mapping model label -> evaluate_ranker() result dict
+                       (each result['test_df'] must have predicted_proba and rmsd columns)
+        output_dir: Directory to save the plot
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = plt.cm.tab10(np.linspace(0, 0.6, len(model_results)))
+    for (label, metrics), color in zip(model_results.items(), colors):
+        df = metrics['test_df']
+        rhos = []
+        for pdb_code in df['pdb_code'].unique():
+            cdf = df[df['pdb_code'] == pdb_code]
+            if len(cdf) >= 2:
+                rho, _ = spearmanr(cdf['predicted_proba'].values, cdf['rmsd'].values)
+                if not np.isnan(rho):
+                    rhos.append(rho)
+        ax.hist(rhos, bins=30, alpha=0.5, color=color, label=f'{label} (mean={np.mean(rhos):.2f})')
+
+    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Spearman ρ (model score vs RMSD) per complex', fontsize=12)
+    ax.set_ylabel('Number of Complexes', fontsize=12)
+    ax.set_title('Per-Complex Score–RMSD Ranking Quality\n'
+                 '(negative ρ = model ranks lower-RMSD poses higher)', fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'spearman_distribution.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved Spearman distribution plot to {output_dir / 'spearman_distribution.png'}")
+
+
 def export_pose_scores_csv(test_df: pd.DataFrame, vina_results: List[Dict], output_dir: Path) -> None:
     """
     Export compact CSV with all pose scores and predictions per complex.
@@ -1522,6 +1932,12 @@ def main():
         action='store_true',
         help='Skip augmenting features from mol2 and PDBQT files (faster but less accurate)'
     )
+    parser.add_argument(
+        '--no-contact-features',
+        action='store_true',
+        help='Skip protein-ligand contact feature augmentation. Use with --load-csv to compare '
+             'performance with vs without contact features while keeping all other augmentation.'
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -1577,6 +1993,13 @@ def main():
         train_df = augment_with_mol2_features(train_df)
         test_df = augment_with_mol2_features(test_df)
 
+        if not args.no_contact_features:
+            print("  Adding protein-ligand contact features (may take ~5-10 min)...")
+            train_df = augment_with_contact_features(train_df)
+            test_df = augment_with_contact_features(test_df)
+        else:
+            print("  Skipping protein-ligand contact features (--no-contact-features set)")
+
         print("  Engineering derived features...")
         train_df = engineer_features(train_df)
         test_df = engineer_features(test_df)
@@ -1594,11 +2017,15 @@ def main():
         print(f"\nTraining {name}...")
         trained[name] = train_fn(train_df)  # returns (model, feature_cols)
 
-    # --- Evaluate all models ---
+    # --- Evaluate all individual models ---
     model_results = {}
     for name, (model, feat_cols) in trained.items():
         print(f"Evaluating {name}...")
         model_results[name] = evaluate_ranker(model, test_df, feat_cols)
+
+    # --- Ensemble: average normalised scores from all three rankers ---
+    print("Evaluating ensemble...")
+    model_results['ensemble'] = evaluate_ensemble(model_results, test_df)
 
     # Choose best model by 2 Å success rate (tie-break: best-pose selection rate)
     best_name = max(
@@ -1628,7 +2055,10 @@ def main():
               f"({metrics['xgb_success_count']}/{n})")
         print(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
               f"({metrics['xgb_success_2A_count']}/{n})")
-        print(f"  Mean RMSD of selected   : {metrics['mean_xgb_rmsd']:.3f} Å")
+        print(f"  Mean/Median RMSD        : {metrics['mean_xgb_rmsd']:.3f} / "
+              f"{metrics['median_xgb_rmsd']:.3f} Å")
+        print(f"  RMSD improvement vs Vina: {metrics['mean_rmsd_improvement']:+.3f} Å")
+        print(f"  Spearman score–RMSD corr: {metrics['spearman_mean']:.3f}")
 
     print(f"\n{'='*60}")
     print(f"Best model: {best_name}")
@@ -1652,7 +2082,10 @@ def main():
                     f"({metrics['xgb_success_count']}/{n})\n")
             f.write(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
                     f"({metrics['xgb_success_2A_count']}/{n})\n")
-            f.write(f"  Mean RMSD               : {metrics['mean_xgb_rmsd']:.3f} Å\n\n")
+            f.write(f"  Mean/Median RMSD        : {metrics['mean_xgb_rmsd']:.3f} / "
+                    f"{metrics['median_xgb_rmsd']:.3f} Å\n")
+            f.write(f"  RMSD improvement vs Vina: {metrics['mean_rmsd_improvement']:+.3f} Å\n")
+            f.write(f"  Spearman score-RMSD corr: {metrics['spearman_mean']:.3f}\n\n")
 
     print(f"Saved metrics to {metrics_file}")
 
@@ -1681,6 +2114,11 @@ def main():
             plot_success_rate_by_rank(best_metrics, best_metrics['test_df'], OUTPUT_DIR)
             plot_feature_importance(best_model, feature_cols, OUTPUT_DIR)
             plot_rmsd_vs_probability(best_metrics['test_df'], OUTPUT_DIR)
+
+            # New diagnostic plots (all models shown together)
+            plot_success_vs_rmsd_threshold(model_results, OUTPUT_DIR)
+            plot_rmsd_cdf(model_results, OUTPUT_DIR)
+            plot_spearman_per_complex(model_results, OUTPUT_DIR)
 
             print("\nAll plots saved successfully!")
         except Exception as e:

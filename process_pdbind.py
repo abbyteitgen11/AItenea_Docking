@@ -21,6 +21,7 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import Descriptors, AllChem
 import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 from scipy.stats import pearsonr, spearmanr
@@ -558,6 +559,157 @@ def extract_pose_features(vina_result: Dict, pose_idx: int, rmsd: float) -> Dict
     }
 
 
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add engineered features computed from existing CSV columns.
+    All features are computed per-complex to avoid data leakage.
+
+    Args:
+        df: DataFrame with vina score columns
+
+    Returns:
+        DataFrame with additional engineered features
+    """
+    new_df = df.copy()
+
+    boltzmann_probs = np.zeros(len(df))
+    gap_to_next = np.zeros(len(df))
+    top2_gaps = np.zeros(len(df))
+
+    kT = 0.592  # RT at 300K in kcal/mol (Vina scores in kcal/mol)
+
+    for pdb_code, group in df.groupby('pdb_code'):
+        idx = group.index
+        scores = group['vina_score'].values
+
+        # Boltzmann-weighted probability (physically motivated)
+        # Vina scores are negative: more negative = more favorable
+        exp_scores = np.exp(-scores / kT)
+        boltzmann_probs[idx] = exp_scores / exp_scores.sum()
+
+        # Gap from each pose to the next worse pose (in score order)
+        # sorted_order[i] gives the index (within group) of rank i pose
+        sorted_order = np.argsort(scores)  # ascending: most negative first
+        group_gaps = np.zeros(len(scores))
+        for j in range(len(sorted_order) - 1):
+            group_gaps[sorted_order[j]] = scores[sorted_order[j + 1]] - scores[sorted_order[j]]
+        gap_to_next[idx] = group_gaps
+
+        # Top-2 score gap: how separated is the best pose from rank 2
+        if len(scores) > 1:
+            sorted_scores = np.sort(scores)
+            top2_gaps[idx] = sorted_scores[1] - sorted_scores[0]
+
+    new_df['boltzmann_prob'] = boltzmann_probs
+    new_df['gap_to_next_pose'] = gap_to_next
+    new_df['top2_score_gap'] = top2_gaps
+    new_df['log_abs_score'] = np.log(np.abs(df['vina_score']) + 1)
+
+    return new_df
+
+
+def augment_with_pdbqt_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add pose-specific geometric features extracted from existing Vina PDBQT output files.
+    Does not rerun Vina - reads already-computed output files.
+
+    Features per pose:
+        pose_rog: radius of gyration (compactness)
+        pose_com_drift: distance of pose COM from rank-1 pose COM
+        pose_max_extent: largest bounding box dimension
+        pose_volume_approx: approximate bounding box volume
+
+    Args:
+        df: DataFrame with pdb_code and pose_idx columns
+
+    Returns:
+        DataFrame with additional geometry columns (NaN where files not found)
+    """
+    geo_cols = ['pose_rog', 'pose_com_drift', 'pose_max_extent', 'pose_volume_approx']
+    new_df = df.copy()
+    for col in geo_cols:
+        new_df[col] = np.nan
+
+    found = 0
+    for pdb_code in df['pdb_code'].unique():
+        pdbqt_file = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
+        if not pdbqt_file.exists():
+            continue
+
+        pose_coords_list = extract_pose_coordinates(pdbqt_file)
+        if not pose_coords_list:
+            continue
+
+        found += 1
+        ref_com = pose_coords_list[0].mean(axis=0)
+
+        pose_feats = []
+        for coords in pose_coords_list:
+            if len(coords) == 0:
+                pose_feats.append({col: np.nan for col in geo_cols})
+                continue
+            com = coords.mean(axis=0)
+            centered = coords - com
+            rog = np.sqrt(np.mean(np.sum(centered ** 2, axis=1)))
+            com_drift = np.linalg.norm(com - ref_com)
+            extent = coords.max(axis=0) - coords.min(axis=0)
+            pose_feats.append({
+                'pose_rog': rog,
+                'pose_com_drift': com_drift,
+                'pose_max_extent': float(extent.max()),
+                'pose_volume_approx': float(extent[0] * extent[1] * extent[2]),
+            })
+
+        complex_mask = new_df['pdb_code'] == pdb_code
+        for row_idx in new_df[complex_mask].index:
+            pose_idx = int(new_df.loc[row_idx, 'pose_idx'])
+            if pose_idx < len(pose_feats):
+                for col, val in pose_feats[pose_idx].items():
+                    new_df.loc[row_idx, col] = val
+
+    print(f"  Added PDBQT geometry features for {found}/{df['pdb_code'].nunique()} complexes")
+    return new_df
+
+
+def augment_with_mol2_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add RDKit 2D molecular descriptors from mol2 files.
+    Each descriptor is the same for all poses of the same ligand but helps the
+    model understand which molecule types have unreliable Vina rankings.
+
+    Args:
+        df: DataFrame with pdb_code column
+
+    Returns:
+        DataFrame with additional molecular descriptor columns
+    """
+    mol2_cache: Dict[str, Dict] = {}
+
+    for pdb_code in df['pdb_code'].unique():
+        # Use direct path instead of slow rglob
+        ligand_mol2 = STRUCTURES_DIR / pdb_code / f"{pdb_code}_ligand.mol2"
+        if not ligand_mol2.exists():
+            continue
+        features = extract_rdkit_features(str(ligand_mol2))
+        if features:
+            mol2_cache[pdb_code] = features
+
+    if not mol2_cache:
+        print("  Warning: No mol2 features extracted")
+        return df
+
+    feat_names = list(next(iter(mol2_cache.values())).keys())
+    new_df = df.copy()
+    for feat in feat_names:
+        new_df[feat] = new_df['pdb_code'].map(
+            lambda x, f=feat: mol2_cache.get(x, {}).get(f, np.nan)
+        )
+
+    print(f"  Added {len(feat_names)} molecular features for "
+          f"{len(mol2_cache)}/{df['pdb_code'].nunique()} complexes")
+    return new_df
+
+
 def prepare_training_data(vina_results: List[Dict]) -> pd.DataFrame:
     """
     Prepare pose-level feature matrix for training.
@@ -635,20 +787,131 @@ def train_rescoring_model(train_df: pd.DataFrame) -> xgb.XGBClassifier:
     num_negatives = np.sum(y == 0)
     scale_pos_weight = num_negatives / num_positives if num_positives > 0 else 1.0
     
-    # Train classifier
+    # Train classifier with regularization to reduce overfitting on small Vina-only features
     model = xgb.XGBClassifier(
-        n_estimators=100,
-        max_depth=6,
-        learning_rate=0.1,
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
         random_state=RANDOM_SEED,
         n_jobs=-1,
         scale_pos_weight=scale_pos_weight,
         eval_metric='logloss'
     )
-    
+
     model.fit(X, y)
-    
+
     return model
+
+
+def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]]:
+    """
+    Train XGBoost ranker to order poses within each complex by predicted quality.
+    Uses continuous RMSD-based relevance (1/(1+rmsd)) so the model learns to
+    rank poses by proximity to the crystal structure rather than binary best/not-best.
+
+    Args:
+        train_df: DataFrame with pose-level features and rmsd column
+
+    Returns:
+        Tuple of (trained XGBRanker, list of feature column names)
+    """
+    feature_cols = [col for col in train_df.columns
+                    if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
+
+    # Ranker requires data sorted by query group
+    sorted_df = train_df.sort_values('pdb_code').reset_index(drop=True)
+
+    X = sorted_df[feature_cols].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Relevance: higher = better = lower RMSD. Maps RMSD in [0, inf) -> (0, 1].
+    y_rel = 1.0 / (1.0 + sorted_df['rmsd'].values)
+
+    # Query IDs: one integer per complex (same for all poses in a complex)
+    pdb_codes = sorted_df['pdb_code'].values
+    _, qid = np.unique(pdb_codes, return_inverse=True)
+
+    ranker = xgb.XGBRanker(
+        objective='rank:pairwise',
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+
+    ranker.fit(X, y_rel, qid=qid)
+
+    return ranker, feature_cols
+
+
+def train_rf_ranker(train_df: pd.DataFrame) -> Tuple[RandomForestRegressor, List[str]]:
+    """
+    Train a Random Forest regressor as a pose ranker.
+    Predicts 1/(1+rmsd) per pose; the pose with the highest predicted score is selected.
+
+    Args:
+        train_df: DataFrame with pose-level features and rmsd column
+
+    Returns:
+        Tuple of (trained RandomForestRegressor, list of feature column names)
+    """
+    feature_cols = [col for col in train_df.columns
+                    if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
+
+    X = train_df[feature_cols].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    y_rel = 1.0 / (1.0 + train_df['rmsd'].values)
+
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=10,
+        min_samples_leaf=5,
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    model.fit(X, y_rel)
+    return model, feature_cols
+
+
+def train_gb_ranker(train_df: pd.DataFrame) -> Tuple[GradientBoostingRegressor, List[str]]:
+    """
+    Train a Gradient Boosting regressor as a pose ranker.
+    Predicts 1/(1+rmsd) per pose; the pose with the highest predicted score is selected.
+
+    Args:
+        train_df: DataFrame with pose-level features and rmsd column
+
+    Returns:
+        Tuple of (trained GradientBoostingRegressor, list of feature column names)
+    """
+    feature_cols = [col for col in train_df.columns
+                    if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
+
+    X = train_df[feature_cols].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    y_rel = 1.0 / (1.0 + train_df['rmsd'].values)
+
+    model = GradientBoostingRegressor(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        min_samples_leaf=5,
+        random_state=RANDOM_SEED,
+    )
+    model.fit(X, y_rel)
+    return model, feature_cols
 
 
 def evaluate_model(model: xgb.XGBClassifier, test_df: pd.DataFrame) -> Dict:
@@ -713,10 +976,14 @@ def evaluate_model(model: xgb.XGBClassifier, test_df: pd.DataFrame) -> Dict:
     # Calculate metrics
     vina_success_rate = vina_success / total_complexes if total_complexes > 0 else 0
     xgb_success_rate = xgb_success / total_complexes if total_complexes > 0 else 0
-    
+
     mean_vina_rmsd = np.mean(vina_selected_rmsds) if vina_selected_rmsds else 0
     mean_xgb_rmsd = np.mean(xgb_selected_rmsds) if xgb_selected_rmsds else 0
-    
+
+    # 2 Å success rate (standard docking benchmark: pose within 2 Å of crystal)
+    vina_success_2A = sum(r < 2.0 for r in vina_selected_rmsds)
+    xgb_success_2A = sum(r < 2.0 for r in xgb_selected_rmsds)
+
     return {
         'total_complexes': total_complexes,
         'vina_success_rate': vina_success_rate,
@@ -725,9 +992,83 @@ def evaluate_model(model: xgb.XGBClassifier, test_df: pd.DataFrame) -> Dict:
         'xgb_success_count': xgb_success,
         'mean_vina_rmsd': mean_vina_rmsd,
         'mean_xgb_rmsd': mean_xgb_rmsd,
+        'vina_success_2A_rate': vina_success_2A / total_complexes if total_complexes > 0 else 0,
+        'xgb_success_2A_rate': xgb_success_2A / total_complexes if total_complexes > 0 else 0,
+        'vina_success_2A_count': vina_success_2A,
+        'xgb_success_2A_count': xgb_success_2A,
         'vina_selected_rmsds': vina_selected_rmsds,
         'xgb_selected_rmsds': xgb_selected_rmsds,
         'test_df': test_df_copy
+    }
+
+
+def evaluate_ranker(ranker: xgb.XGBRanker, test_df: pd.DataFrame,
+                    feature_cols: List[str]) -> Dict:
+    """
+    Evaluate XGBoost ranker for pose selection.
+    Predicts a relevance score per pose; the pose with the highest score is selected.
+
+    Args:
+        ranker: Trained XGBRanker
+        test_df: DataFrame with test features and rmsd column
+        feature_cols: List of feature column names used during training
+
+    Returns:
+        Dictionary of evaluation metrics (same keys as evaluate_model)
+    """
+    X_test = test_df[feature_cols].values
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+
+    ranker_scores = ranker.predict(X_test)
+
+    test_df_copy = test_df.copy()
+    test_df_copy['predicted_proba'] = ranker_scores  # reuse field for plot compatibility
+
+    vina_success = 0
+    xgb_success = 0
+    total_complexes = 0
+    vina_selected_rmsds = []
+    xgb_selected_rmsds = []
+
+    for pdb_code in test_df_copy['pdb_code'].unique():
+        complex_df = test_df_copy[test_df_copy['pdb_code'] == pdb_code]
+        if len(complex_df) == 0:
+            continue
+
+        total_complexes += 1
+        actual_best_idx = complex_df['rmsd'].idxmin()
+        vina_best_idx = complex_df['vina_rank'].idxmin()
+        xgb_best_idx = complex_df['predicted_proba'].idxmax()
+
+        vina_rmsd = complex_df.loc[vina_best_idx, 'rmsd']
+        xgb_rmsd = complex_df.loc[xgb_best_idx, 'rmsd']
+
+        vina_selected_rmsds.append(vina_rmsd)
+        xgb_selected_rmsds.append(xgb_rmsd)
+
+        if vina_best_idx == actual_best_idx:
+            vina_success += 1
+        if xgb_best_idx == actual_best_idx:
+            xgb_success += 1
+
+    vina_success_2A = sum(r < 2.0 for r in vina_selected_rmsds)
+    xgb_success_2A = sum(r < 2.0 for r in xgb_selected_rmsds)
+
+    return {
+        'total_complexes': total_complexes,
+        'vina_success_rate': vina_success / total_complexes if total_complexes > 0 else 0,
+        'xgb_success_rate': xgb_success / total_complexes if total_complexes > 0 else 0,
+        'vina_success_count': vina_success,
+        'xgb_success_count': xgb_success,
+        'mean_vina_rmsd': np.mean(vina_selected_rmsds) if vina_selected_rmsds else 0,
+        'mean_xgb_rmsd': np.mean(xgb_selected_rmsds) if xgb_selected_rmsds else 0,
+        'vina_success_2A_rate': vina_success_2A / total_complexes if total_complexes > 0 else 0,
+        'xgb_success_2A_rate': xgb_success_2A / total_complexes if total_complexes > 0 else 0,
+        'vina_success_2A_count': vina_success_2A,
+        'xgb_success_2A_count': xgb_success_2A,
+        'vina_selected_rmsds': vina_selected_rmsds,
+        'xgb_selected_rmsds': xgb_selected_rmsds,
+        'test_df': test_df_copy,
     }
 
 
@@ -997,7 +1338,7 @@ def export_pose_scores_csv(test_df: pd.DataFrame, vina_results: List[Dict], outp
             record[f'pose_{pose_idx}_vina_score'] = row['vina_score']
             record[f'pose_{pose_idx}_vina_rank'] = int(row['vina_rank'])
             record[f'pose_{pose_idx}_rmsd'] = row['rmsd']
-            record[f'pose_{pose_idx}_xgb_probability'] = row['predicted_proba']
+            record[f'pose_{pose_idx}_ranker_score'] = row['predicted_proba']
             record[f'pose_{pose_idx}_is_best'] = int(row['is_best_pose'])
             
             # Add feature values for this pose
@@ -1026,7 +1367,58 @@ def export_pose_scores_csv(test_df: pd.DataFrame, vina_results: List[Dict], outp
     print(f"Saved detailed pose scores to {output_file}")
     print(f"  Total complexes: {len(df)}")
     print(f"  Vina accuracy: {df['vina_correct'].mean():.3f}")
-    print(f"  XGBoost accuracy: {df['xgb_correct'].mean():.3f}")
+    print(f"  Best model accuracy: {df['xgb_correct'].mean():.3f}")
+
+
+def export_score_comparison_csv(model_results: Dict, output_dir: Path) -> None:
+    """
+    Export a long-format per-pose CSV comparing all ranker model scores to Vina scores.
+    One row per pose (not per complex), making it easy to inspect score distributions
+    and compare model rankings directly against Vina.
+
+    Columns: pdb_code, pose_idx, rmsd, is_best_pose, vina_score, vina_rank,
+             vina_selected, {model}_score, {model}_rank, {model}_selected for each model.
+
+    Args:
+        model_results: Dict mapping model label to evaluate_ranker() result dict.
+                       Each result dict must contain 'test_df' with 'predicted_proba' column.
+        output_dir: Directory to save the CSV
+    """
+    # Build base dataframe from the first model's test_df (all share same base rows)
+    first_result = next(iter(model_results.values()))
+    base_df = first_result['test_df']
+
+    out = base_df[['pdb_code', 'pose_idx', 'rmsd', 'is_best_pose',
+                   'vina_score', 'vina_rank']].copy().reset_index(drop=True)
+
+    # Vina's selected pose (rank 1 within each complex)
+    out['vina_selected'] = (out['vina_rank'] == 1).astype(int)
+
+    for label, metrics in model_results.items():
+        scores = metrics['test_df']['predicted_proba'].values
+        col_score = f'{label}_score'
+        col_rank = f'{label}_rank'
+        col_sel = f'{label}_selected'
+
+        out[col_score] = scores
+
+        # Rank within each complex: 1 = highest model score = predicted best pose
+        out[col_rank] = out.groupby('pdb_code')[col_score] \
+                           .rank(ascending=False, method='first').astype(int)
+        out[col_sel] = (out[col_rank] == 1).astype(int)
+
+    path = output_dir / 'score_comparison.csv'
+    out.to_csv(path, index=False)
+    print(f"Saved per-pose score comparison to {path}  ({len(out)} rows, {len(out.columns)} columns)")
+
+    # Print a quick summary using metrics already computed by evaluate_ranker
+    vina_rate = out.groupby('pdb_code').apply(
+        lambda g: int(g.loc[g['vina_rank'].idxmin(), 'rmsd'] == g['rmsd'].min())
+    ).mean()
+    print(f"  Vina selects correct pose : {vina_rate:.3f}")
+    for label, metrics in model_results.items():
+        print(f"  {label} selects correct pose: {metrics['xgb_success_rate']:.3f}")
+
 
 def load_data_from_csv(train_csv: Path, test_csv: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -1109,14 +1501,14 @@ def main():
         description='Process PDBbind dataset for molecular docking pose rescoring with XGBoost'
     )
     parser.add_argument(
-        '--load-csv', 
-        nargs=2, 
+        '--load-csv',
+        nargs=2,
         metavar=('TRAIN_CSV', 'TEST_CSV'),
         help='Load existing training and test CSV files instead of running Vina'
     )
     parser.add_argument(
-        '--num-complexes', 
-        type=int, 
+        '--num-complexes',
+        type=int,
         default=10,
         help='Number of complexes to process (default: 10)'
     )
@@ -1125,11 +1517,16 @@ def main():
         action='store_true',
         help='Skip generating analysis plots'
     )
+    parser.add_argument(
+        '--no-augment',
+        action='store_true',
+        help='Skip augmenting features from mol2 and PDBQT files (faster but less accurate)'
+    )
     args = parser.parse_args()
-    
+
     # Create output directory
     OUTPUT_DIR.mkdir(exist_ok=True)
-    
+
     if args.load_csv:
         # Load existing CSV files
         print("Loading data from CSV files...")
@@ -1140,120 +1537,160 @@ def main():
         # Process complexes with Vina
         num_complexes = args.num_complexes
         vina_results = process_all_complexes(num_complexes)
-        
+
         print(f"\nProcessed {len(vina_results)} complexes successfully")
-        
+
         # Prepare training data
         print("Preparing training data...")
         train_df = prepare_training_data(vina_results)
         print(f"Training data shape: {train_df.shape}")
-        
+
         if len(train_df) < 10:
             print("Not enough data for training")
             return
-        
+
         # Split data by complex (not by pose) to avoid data leakage
         unique_complexes = train_df['pdb_code'].unique()
         train_complexes, test_complexes = train_test_split(
             unique_complexes, test_size=0.2, random_state=RANDOM_SEED
         )
-        
+
         train_df_final = train_df[train_df['pdb_code'].isin(train_complexes)]
         test_df = train_df[train_df['pdb_code'].isin(test_complexes)]
-        
+
         # Save results
         train_df_final.to_csv(OUTPUT_DIR / "training_data.csv", index=False)
         test_df.to_csv(OUTPUT_DIR / "test_data.csv", index=False)
         print(f"Results saved to {OUTPUT_DIR}")
-        
+
         train_df = train_df_final
-    
-    # Train model
-    print("\nTraining XGBoost classifier...")
-    model = train_rescoring_model(train_df)
-    
-    # Evaluate
-    print("\nEvaluating model...")
-    metrics = evaluate_model(model, test_df)
-    
+
+    # --- Feature augmentation ---
+    if not args.no_augment:
+        print("\nAugmenting features (this may take a few minutes)...")
+
+        print("  Adding pose geometry from PDBQT files...")
+        train_df = augment_with_pdbqt_features(train_df)
+        test_df = augment_with_pdbqt_features(test_df)
+
+        print("  Adding molecular descriptors from mol2 files...")
+        train_df = augment_with_mol2_features(train_df)
+        test_df = augment_with_mol2_features(test_df)
+
+        print("  Engineering derived features...")
+        train_df = engineer_features(train_df)
+        test_df = engineer_features(test_df)
+
+        print(f"  Feature count after augmentation: {train_df.shape[1]} columns")
+
+    # --- Train all ranker models ---
+    models_to_train = {
+        'xgb_ranker': train_ranker_model,
+        'rf_ranker':  train_rf_ranker,
+        'gb_ranker':  train_gb_ranker,
+    }
+    trained = {}
+    for name, train_fn in models_to_train.items():
+        print(f"\nTraining {name}...")
+        trained[name] = train_fn(train_df)  # returns (model, feature_cols)
+
+    # --- Evaluate all models ---
+    model_results = {}
+    for name, (model, feat_cols) in trained.items():
+        print(f"Evaluating {name}...")
+        model_results[name] = evaluate_ranker(model, test_df, feat_cols)
+
+    # Choose best model by 2 Å success rate (tie-break: best-pose selection rate)
+    best_name = max(
+        model_results,
+        key=lambda k: (model_results[k]['xgb_success_2A_rate'],
+                       model_results[k]['xgb_success_rate'])
+    )
+    best_metrics = model_results[best_name]
+    best_model, _ = trained[best_name]
+
+    # --- Print results ---
+    n = best_metrics['total_complexes']
     print(f"\n{'='*60}")
     print("POSE SELECTION PERFORMANCE")
     print(f"{'='*60}")
-    print(f"Total test complexes: {metrics['total_complexes']}")
+    print(f"Total test complexes: {n}")
     print(f"\nAutoDock Vina (baseline):")
-    print(f"  Success rate: {metrics['vina_success_rate']:.3f} ({metrics['vina_success_count']}/{metrics['total_complexes']})")
-    print(f"  Mean RMSD of selected poses: {metrics['mean_vina_rmsd']:.3f} Å")
-    print(f"\nXGBoost Rescoring Model:")
-    print(f"  Success rate: {metrics['xgb_success_rate']:.3f} ({metrics['xgb_success_count']}/{metrics['total_complexes']})")
-    print(f"  Mean RMSD of selected poses: {metrics['mean_xgb_rmsd']:.3f} Å")
-    
-    if metrics['xgb_success_rate'] > metrics['vina_success_rate']:
-        improvement = (metrics['xgb_success_rate'] - metrics['vina_success_rate']) * 100
-        print(f"\n✓ XGBoost improved success rate by {improvement:.1f} percentage points")
-    
-    # Save performance metrics
+    print(f"  Best-pose selection rate : {best_metrics['vina_success_rate']:.3f} "
+          f"({best_metrics['vina_success_count']}/{n})")
+    print(f"  Poses within 2 Å        : {best_metrics['vina_success_2A_rate']:.3f} "
+          f"({best_metrics['vina_success_2A_count']}/{n})")
+    print(f"  Mean RMSD of selected   : {best_metrics['mean_vina_rmsd']:.3f} Å")
+
+    for name, metrics in model_results.items():
+        print(f"\n--- {name} ---")
+        print(f"  Best-pose selection rate : {metrics['xgb_success_rate']:.3f} "
+              f"({metrics['xgb_success_count']}/{n})")
+        print(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
+              f"({metrics['xgb_success_2A_count']}/{n})")
+        print(f"  Mean RMSD of selected   : {metrics['mean_xgb_rmsd']:.3f} Å")
+
+    print(f"\n{'='*60}")
+    print(f"Best model: {best_name}")
+
+    # --- Save performance metrics ---
     metrics_file = OUTPUT_DIR / 'pose_selection_metrics.txt'
     with open(metrics_file, 'w') as f:
         f.write("=" * 60 + "\n")
         f.write("POSE SELECTION PERFORMANCE METRICS\n")
         f.write("=" * 60 + "\n\n")
-        f.write(f"Total test complexes: {metrics['total_complexes']}\n\n")
+        f.write(f"Total test complexes: {n}\n\n")
         f.write("AutoDock Vina (baseline):\n")
-        f.write(f"  Success rate: {metrics['vina_success_rate']:.3f} ({metrics['vina_success_count']}/{metrics['total_complexes']})\n")
-        f.write(f"  Mean RMSD: {metrics['mean_vina_rmsd']:.3f} Å\n\n")
-        f.write("XGBoost Rescoring Model:\n")
-        f.write(f"  Success rate: {metrics['xgb_success_rate']:.3f} ({metrics['xgb_success_count']}/{metrics['total_complexes']})\n")
-        f.write(f"  Mean RMSD: {metrics['mean_xgb_rmsd']:.3f} Å\n")
-    
-    print(f"\nSaved metrics to {metrics_file}")
-    
-    # Export detailed pose scores CSV
+        f.write(f"  Best-pose selection rate : {best_metrics['vina_success_rate']:.3f} "
+                f"({best_metrics['vina_success_count']}/{n})\n")
+        f.write(f"  Poses within 2 Å        : {best_metrics['vina_success_2A_rate']:.3f} "
+                f"({best_metrics['vina_success_2A_count']}/{n})\n")
+        f.write(f"  Mean RMSD               : {best_metrics['mean_vina_rmsd']:.3f} Å\n\n")
+        for name, metrics in model_results.items():
+            f.write(f"{name}{'  <-- best' if name == best_name else ''}:\n")
+            f.write(f"  Best-pose selection rate : {metrics['xgb_success_rate']:.3f} "
+                    f"({metrics['xgb_success_count']}/{n})\n")
+            f.write(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
+                    f"({metrics['xgb_success_2A_count']}/{n})\n")
+            f.write(f"  Mean RMSD               : {metrics['mean_xgb_rmsd']:.3f} Å\n\n")
+
+    print(f"Saved metrics to {metrics_file}")
+
+    # --- Export per-pose score comparison CSV ---
+    print("\nExporting score comparison CSV...")
+    export_score_comparison_csv(model_results, OUTPUT_DIR)
+
+    # --- Export detailed pose scores CSV (best model) ---
     print("\nExporting detailed pose scores...")
     if args.load_csv:
-        # If loading from CSV, we don't have vina_results, create empty list
         vina_results_for_export = []
     else:
-        # Get test complexes only
         test_complexes_list = test_df['pdb_code'].unique()
         vina_results_for_export = [vr for vr in vina_results if vr['pdb_code'] in test_complexes_list]
-    
-    export_pose_scores_csv(metrics['test_df'], vina_results_for_export, OUTPUT_DIR)
-    
-    # Generate plots
+
+    export_pose_scores_csv(best_metrics['test_df'], vina_results_for_export, OUTPUT_DIR)
+
+    # --- Generate plots (best model) ---
     if not args.no_plots:
         print("\nGenerating visualization plots...")
         try:
-            # Get feature names for importance plot
-            feature_cols = [col for col in test_df.columns 
-                           if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
-            
-            # Plot 1: RMSD distribution comparison
-            plot_rmsd_distribution_comparison(metrics, OUTPUT_DIR)
-            
-            # Plot 2: Success rate by rank
-            plot_success_rate_by_rank(metrics, metrics['test_df'], OUTPUT_DIR)
-            
-            # Plot 3: Feature importance
-            plot_feature_importance(model, feature_cols, OUTPUT_DIR)
-            
-            # Plot 4: ROC curve
-            plot_roc_curve(test_df, model, OUTPUT_DIR)
-            
-            # Plot 5: Precision-Recall curve
-            plot_precision_recall_curve(test_df, model, OUTPUT_DIR)
-            
-            # Plot 6: RMSD vs probability
-            plot_rmsd_vs_probability(metrics['test_df'], OUTPUT_DIR)
-            
+            feature_cols = [col for col in test_df.columns
+                            if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
+
+            plot_rmsd_distribution_comparison(best_metrics, OUTPUT_DIR)
+            plot_success_rate_by_rank(best_metrics, best_metrics['test_df'], OUTPUT_DIR)
+            plot_feature_importance(best_model, feature_cols, OUTPUT_DIR)
+            plot_rmsd_vs_probability(best_metrics['test_df'], OUTPUT_DIR)
+
             print("\nAll plots saved successfully!")
         except Exception as e:
             print(f"\nWarning: Could not generate some plots: {e}")
             import traceback
             traceback.print_exc()
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("Analysis complete!")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

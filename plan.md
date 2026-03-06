@@ -11,7 +11,7 @@
 
 ---
 
-## Overall Progress: ~45%
+## Overall Progress: ~55%
 
 ---
 
@@ -53,6 +53,15 @@ to the crystal ligand (standard docking benchmark).
 - New plots: success_vs_threshold.png, rmsd_cdf.png, spearman_distribution.png
 - Result with contacts: RF 0.328, ensemble 0.330 vs Vina 0.282
 
+### Stage 8 — Binding affinity prediction [COMPLETE]
+- Join experimental pKd/ΔG from `index/INDEX_general_PL.2020R1.lst` at runtime
+- Use Vina rank-1 pose per complex; collapse from per-pose to per-complex
+- Train RF + GB regressors on ΔG target (same 37 features as pose rankers)
+- Evaluate: Pearson r, Spearman r, RMSE, MAE vs Vina baseline
+- Result: GB r=0.643, RF r=0.634 vs Vina baseline r=0.215 (large improvement)
+- Output: `output/affinity_predictions.csv`, `output/affinity_predictions.png`
+- Added `--no-affinity` flag
+
 ### Stage 4 — Hyperparameter optimisation [TODO]
 - Grid/random search or Optuna for XGB, RF, GB hyperparameters
 - Cross-validation on training set (avoid test set contamination)
@@ -86,6 +95,7 @@ to the crystal ligand (standard docking benchmark).
 - [x] `--load-csv` flag (fast model iteration)
 - [x] `--no-augment` flag
 - [x] `--no-contact-features` flag
+- [x] `--no-affinity` flag
 
 ### Features
 - [x] Base Vina features (8): score, rank, diffs, z-score, num_poses, range
@@ -102,6 +112,7 @@ to the crystal ligand (standard docking benchmark).
 - [x] Random Forest regressor (1/(1+rmsd) target)
 - [x] Gradient Boosting regressor
 - [x] Ensemble (min-max normalised average)
+- [x] RF + GB affinity regressors (ΔG prediction)
 - [ ] Hyperparameter optimisation
 - [ ] Neural network / GNN
 
@@ -114,6 +125,8 @@ to the crystal ligand (standard docking benchmark).
 - [x] `output/score_comparison.csv` (per-pose, all models vs Vina)
 - [x] `output/pose_scores_detailed.csv`
 - [x] `output/pose_selection_metrics.txt`
+- [x] Pearson r, Spearman r, RMSE, MAE for affinity models
+- [x] `output/affinity_predictions.csv` (per-complex predicted vs experimental ΔG)
 - [ ] Per-protein-family breakdown
 
 ### Plots
@@ -124,6 +137,7 @@ to the crystal ligand (standard docking benchmark).
 - [x] Success rate vs RMSD threshold (all models)
 - [x] RMSD CDF (all models)
 - [x] Spearman distribution (all models)
+- [x] Affinity scatter plot (Vina vs ML, coloured by pose RMSD)
 - [ ] Learning curves (train/test performance vs n_complexes)
 - [ ] Calibration plot
 
@@ -136,6 +150,7 @@ to the crystal ligand (standard docking benchmark).
 | 1 — Basic classifier | Complete | 100% |
 | 2 — Ranker + feature engineering | Complete | 100% |
 | 3 — Contacts + ensemble + diagnostics | Complete | 100% |
+| 8 — Binding affinity prediction | Complete | 100% |
 | 4 — Hyperparameter optimisation | Not started | 0% |
 | 5 — Richer contact features | Not started | 0% |
 | 6 — Neural network | Not started | 0% |
@@ -172,4 +187,4 @@ Priority order — edit/reorder as needed:
 
 ---
 
-*Last updated: 2026-02-23*
+*Last updated: 2026-03-06*

@@ -127,6 +127,48 @@ def load_binding_data() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def join_affinity_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join experimental binding affinity onto a per-pose DataFrame.
+
+    Calls load_binding_data() to read the PDBbind index file, converts
+    affinity_nM to pKd and ΔG (kcal/mol), then left-merges onto df by
+    pdb_code.  Complexes absent from the index get NaN for both affinity
+    columns.
+
+    Args:
+        df: Per-pose DataFrame with at minimum a 'pdb_code' column.
+
+    Returns:
+        Copy of df with two new columns:
+            exp_affinity_pKd       (-log10(Kd_in_M)), typically 2–12 for PDBbind
+            exp_affinity_kcal_mol  (-1.364 * pKd), same sign convention as Vina
+    """
+    try:
+        binding_df = load_binding_data()
+    except FileNotFoundError as e:
+        print(f"  Warning: {e} — skipping affinity labels")
+        df = df.copy()
+        df['exp_affinity_pKd'] = np.nan
+        df['exp_affinity_kcal_mol'] = np.nan
+        return df
+
+    binding_df = binding_df[['pdb_code', 'affinity_nM']].copy()
+    binding_df['exp_affinity_pKd'] = -np.log10(binding_df['affinity_nM'] * 1e-9)
+    binding_df['exp_affinity_kcal_mol'] = -1.364 * binding_df['exp_affinity_pKd']
+
+    out = df.merge(
+        binding_df[['pdb_code', 'exp_affinity_pKd', 'exp_affinity_kcal_mol']],
+        on='pdb_code',
+        how='left'
+    )
+    n_complexes_with = out.loc[out['exp_affinity_pKd'].notna(), 'pdb_code'].nunique()
+    n_complexes_total = df['pdb_code'].nunique()
+    print(f"  Affinity labels: {n_complexes_with}/{n_complexes_total} complexes have "
+          f"experimental data ({n_complexes_total - n_complexes_with} missing → NaN)")
+    return out
+
+
 def get_complexes() -> List[str]:
     """
     Get list of PDB codes that have both ligand and protein files.
@@ -1365,6 +1407,193 @@ def evaluate_ensemble(model_results: Dict, test_df: pd.DataFrame) -> Dict:
     return result
 
 
+def prepare_affinity_data(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """
+    Build the per-complex affinity regression dataset from the rank-1 Vina pose.
+
+    Args:
+        df:           Per-pose DataFrame with affinity columns from join_affinity_labels().
+        feature_cols: Feature column names (same set used by the pose rankers).
+
+    Returns:
+        Per-complex DataFrame (one row per complex) with feature_cols plus
+        pdb_code, exp_affinity_pKd, exp_affinity_kcal_mol, vina_score, rmsd, is_best_pose.
+    """
+    rank1_df = df[df['vina_rank'] == 1].copy()
+    rank1_df = rank1_df.drop_duplicates(subset='pdb_code', keep='first')
+
+    before = rank1_df['pdb_code'].nunique()
+    rank1_df = rank1_df.dropna(subset=['exp_affinity_kcal_mol'])
+    after = rank1_df['pdb_code'].nunique()
+    print(f"  Affinity dataset: {after} complexes with labels "
+          f"(dropped {before - after} without experimental affinity)")
+
+    meta_cols = ['pdb_code', 'exp_affinity_pKd', 'exp_affinity_kcal_mol',
+                 'vina_score', 'rmsd', 'is_best_pose']
+    feat_present = [c for c in feature_cols if c in rank1_df.columns]
+    keep_cols = meta_cols + [c for c in feat_present if c not in meta_cols]
+    return rank1_df[keep_cols].reset_index(drop=True)
+
+
+def train_affinity_model(
+    train_affinity_df: pd.DataFrame,
+    feature_cols: List[str]
+) -> Dict:
+    """
+    Train RF and GB regressors to predict experimental binding affinity (ΔG, kcal/mol).
+
+    Args:
+        train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
+        feature_cols:      Feature column names.
+
+    Returns:
+        Dict mapping model name → (fitted model, feature_cols used):
+            'rf_affinity':  (RandomForestRegressor, cols)
+            'gb_affinity':  (GradientBoostingRegressor, cols)
+    """
+    available_cols = [c for c in feature_cols if c in train_affinity_df.columns]
+    X = train_affinity_df[available_cols].values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    y = train_affinity_df['exp_affinity_kcal_mol'].values
+
+    rf = RandomForestRegressor(
+        n_estimators=300, max_depth=10, min_samples_leaf=5,
+        random_state=RANDOM_SEED, n_jobs=-1
+    )
+    rf.fit(X, y)
+
+    gb = GradientBoostingRegressor(
+        n_estimators=300, max_depth=5, learning_rate=0.05,
+        subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED
+    )
+    gb.fit(X, y)
+
+    print(f"  Trained affinity models on {len(train_affinity_df)} complexes, "
+          f"{len(available_cols)} features")
+    return {
+        'rf_affinity': (rf, available_cols),
+        'gb_affinity': (gb, available_cols),
+    }
+
+
+def evaluate_affinity_model(
+    models: Dict,
+    test_affinity_df: pd.DataFrame,
+    feature_cols: List[str]
+) -> Dict:
+    """
+    Evaluate binding affinity models and Vina baseline on the test set.
+
+    Returns a dict mapping model name → metrics dict with keys:
+        pearson_r, spearman_r, rmse, mae, y_true, y_pred, rmsd_rank1
+    Includes a 'vina_baseline' entry using raw Vina rank-1 score.
+    """
+    y_true = test_affinity_df['exp_affinity_kcal_mol'].values
+    rmsd_rank1 = test_affinity_df['rmsd'].values
+
+    results = {}
+
+    y_vina = test_affinity_df['vina_score'].values
+    r_p, _ = pearsonr(y_vina, y_true)
+    r_s, _ = spearmanr(y_vina, y_true)
+    results['vina_baseline'] = {
+        'pearson_r':  float(r_p),
+        'spearman_r': float(r_s),
+        'rmse':       float(np.sqrt(mean_squared_error(y_true, y_vina))),
+        'mae':        float(np.mean(np.abs(y_true - y_vina))),
+        'y_true':     y_true,
+        'y_pred':     y_vina,
+        'rmsd_rank1': rmsd_rank1,
+    }
+
+    for name, (model, cols_used) in models.items():
+        available = [c for c in cols_used if c in test_affinity_df.columns]
+        X = test_affinity_df[available].values
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        y_pred = model.predict(X)
+        r_p, _ = pearsonr(y_pred, y_true)
+        r_s, _ = spearmanr(y_pred, y_true)
+        results[name] = {
+            'pearson_r':  float(r_p),
+            'spearman_r': float(r_s),
+            'rmse':       float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            'mae':        float(np.mean(np.abs(y_true - y_pred))),
+            'y_true':     y_true,
+            'y_pred':     y_pred,
+            'rmsd_rank1': rmsd_rank1,
+        }
+
+    return results
+
+
+def plot_affinity_predictions(affinity_metrics: Dict, output_dir: Path) -> None:
+    """
+    Side-by-side scatter: Vina score vs exp ΔG (left), best ML model vs exp ΔG (right).
+    Points coloured by rank-1 pose RMSD (0–10 Å, RdYlGn_r colourmap).
+    """
+    ml_names = [k for k in affinity_metrics if k != 'vina_baseline']
+    best_ml_name = max(ml_names, key=lambda k: affinity_metrics[k]['pearson_r'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sc = None
+    for ax, name in zip(axes, ['vina_baseline', best_ml_name]):
+        m = affinity_metrics[name]
+        y_true = m['y_true']
+        y_pred = m['y_pred']
+        rmsd_colors = np.clip(m['rmsd_rank1'], 0, 10)
+
+        sc = ax.scatter(y_true, y_pred, c=rmsd_colors, cmap='RdYlGn_r',
+                        vmin=0, vmax=10, alpha=0.6, s=20, edgecolors='none')
+
+        lims = [min(y_true.min(), y_pred.min()) - 0.5,
+                max(y_true.max(), y_pred.max()) + 0.5]
+        ax.plot(lims, lims, 'k--', lw=1, alpha=0.5)
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+
+        label = 'Vina score' if name == 'vina_baseline' else name
+        ax.set_xlabel('Experimental ΔG (kcal/mol)', fontsize=12)
+        ax.set_ylabel(f'Predicted — {label} (kcal/mol)', fontsize=12)
+        ax.set_title(
+            f'{label}\nPearson r={m["pearson_r"]:.3f}  '
+            f'Spearman r={m["spearman_r"]:.3f}  '
+            f'RMSE={m["rmse"]:.2f} kcal/mol',
+            fontsize=11
+        )
+        ax.grid(True, alpha=0.3)
+
+    if sc is not None:
+        plt.colorbar(sc, ax=axes[1], label='Rank-1 pose RMSD (Å)')
+    plt.tight_layout()
+    out_path = output_dir / 'affinity_predictions.png'
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved affinity scatter plot to {out_path}")
+
+
+def export_affinity_predictions_csv(
+    test_affinity_df: pd.DataFrame,
+    affinity_metrics: Dict,
+    output_dir: Path
+) -> None:
+    """
+    Export one row per test complex: pdb_code, experimental labels, Vina score,
+    and the best ML model's predicted ΔG.
+    """
+    ml_names = [k for k in affinity_metrics if k != 'vina_baseline']
+    best_ml_name = max(ml_names, key=lambda k: affinity_metrics[k]['pearson_r'])
+
+    out = test_affinity_df[['pdb_code', 'exp_affinity_pKd',
+                             'exp_affinity_kcal_mol', 'vina_score']].copy()
+    out['predicted_affinity_kcal_mol'] = affinity_metrics[best_ml_name]['y_pred']
+    out['best_model'] = best_ml_name
+
+    path = output_dir / 'affinity_predictions.csv'
+    out.to_csv(path, index=False)
+    print(f"Saved affinity predictions to {path}  ({len(out)} complexes, "
+          f"model={best_ml_name})")
+
+
 def plot_rmsd_distribution_comparison(metrics: Dict, output_dir: Path) -> None:
     """
     Plot 1: RMSD distribution comparison between Vina and XGBoost selected poses.
@@ -1938,6 +2167,11 @@ def main():
         help='Skip protein-ligand contact feature augmentation. Use with --load-csv to compare '
              'performance with vs without contact features while keeping all other augmentation.'
     )
+    parser.add_argument(
+        '--no-affinity',
+        action='store_true',
+        help='Skip binding affinity prediction step (faster if only pose ranking is needed)'
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -2125,6 +2359,68 @@ def main():
             print(f"\nWarning: Could not generate some plots: {e}")
             import traceback
             traceback.print_exc()
+
+    # ================================================================
+    # --- Binding affinity prediction (rank-1 pose → ΔG regression) ---
+    # ================================================================
+    if not args.no_affinity:
+        print("\n" + "=" * 60)
+        print("BINDING AFFINITY PREDICTION")
+        print("=" * 60)
+
+        print("\nJoining affinity labels...")
+        train_df_aff = join_affinity_labels(train_df)
+        test_df_aff  = join_affinity_labels(test_df)
+
+        _aff_exclude = {'pdb_code', 'pose_idx', 'is_best_pose', 'rmsd',
+                        'exp_affinity_pKd', 'exp_affinity_kcal_mol'}
+        feature_cols_aff = [c for c in train_df.columns if c not in _aff_exclude]
+
+        print("Preparing affinity datasets...")
+        train_aff = prepare_affinity_data(train_df_aff, feature_cols_aff)
+        test_aff  = prepare_affinity_data(test_df_aff,  feature_cols_aff)
+
+        if len(train_aff) < 10 or len(test_aff) < 2:
+            print("  Warning: Too few complexes with affinity labels. Skipping affinity models.")
+        else:
+            print("Training affinity models...")
+            affinity_models = train_affinity_model(train_aff, feature_cols_aff)
+
+            print("Evaluating affinity models...")
+            affinity_metrics = evaluate_affinity_model(affinity_models, test_aff, feature_cols_aff)
+
+            n_aff = len(test_aff)
+            print(f"\n{'='*60}")
+            print("BINDING AFFINITY PERFORMANCE")
+            print(f"{'='*60}")
+            print(f"Test complexes with affinity labels: {n_aff}")
+
+            print(f"\nVina baseline (rank-1 score vs exp ΔG):")
+            vm = affinity_metrics['vina_baseline']
+            print(f"  Pearson r  : {vm['pearson_r']:+.3f}")
+            print(f"  Spearman r : {vm['spearman_r']:+.3f}")
+            print(f"  RMSE       : {vm['rmse']:.3f} kcal/mol")
+            print(f"  MAE        : {vm['mae']:.3f} kcal/mol")
+
+            for name in sorted(k for k in affinity_metrics if k != 'vina_baseline'):
+                am = affinity_metrics[name]
+                print(f"\n--- {name} ---")
+                print(f"  Pearson r  : {am['pearson_r']:+.3f}")
+                print(f"  Spearman r : {am['spearman_r']:+.3f}")
+                print(f"  RMSE       : {am['rmse']:.3f} kcal/mol")
+                print(f"  MAE        : {am['mae']:.3f} kcal/mol")
+
+            print("\nExporting affinity predictions CSV...")
+            export_affinity_predictions_csv(test_aff, affinity_metrics, OUTPUT_DIR)
+
+            if not args.no_plots:
+                print("Generating affinity scatter plot...")
+                try:
+                    plot_affinity_predictions(affinity_metrics, OUTPUT_DIR)
+                except Exception as e:
+                    print(f"Warning: Could not generate affinity plot: {e}")
+    else:
+        print("\nSkipping affinity prediction (--no-affinity set).")
 
     print("\n" + "=" * 60)
     print("Analysis complete!")

@@ -22,7 +22,9 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, AllChem
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.model_selection import train_test_split
+import json
+import optuna
+from sklearn.model_selection import train_test_split, GroupKFold, KFold
 from sklearn.metrics import mean_squared_error, r2_score
 from scipy.spatial import KDTree
 from scipy.stats import pearsonr, spearmanr
@@ -1048,13 +1050,134 @@ def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]
     return ranker, feature_cols
 
 
-def train_rf_ranker(train_df: pd.DataFrame) -> Tuple[RandomForestRegressor, List[str]]:
+def optimize_ranker_hyperparams(
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """
+    Use Optuna to find optimal RF ranker hyperparameters via 5-fold GroupKFold CV.
+
+    Poses from the same complex are always in the same fold (GroupKFold) to avoid
+    data leakage. Objective: maximise mean neg-MSE on the 1/(1+rmsd) target.
+
+    Args:
+        train_df:     Per-pose training DataFrame (augmented).
+        feature_cols: Feature column names.
+        n_trials:     Number of NEW Optuna trials to run.
+        storage:      SQLite URL for persisting/resuming trials, e.g.
+                      "sqlite:///output/optuna_studies.db". None = in-memory only.
+
+    Returns:
+        Dict of best hyperparameters found across all trials.
+    """
+    available_cols = [c for c in feature_cols if c in train_df.columns]
+    X = np.nan_to_num(train_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = 1.0 / (1.0 + train_df['rmsd'].values)
+    _, groups = np.unique(train_df['pdb_code'].values, return_inverse=True)
+    gkf = GroupKFold(n_splits=5)
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_categorical('n_estimators', [200, 300, 500, 750]),
+            'max_depth':        trial.suggest_categorical('max_depth', [5, 8, 10, 15, 20]),
+            'min_samples_leaf': trial.suggest_categorical('min_samples_leaf', [1, 2, 3, 5, 10]),
+            'max_features':     trial.suggest_categorical('max_features', ['sqrt', 'log2', 0.5, 0.7]),
+        }
+        scores = []
+        for train_idx, val_idx in gkf.split(X, y, groups=groups):
+            rf = RandomForestRegressor(**params, random_state=RANDOM_SEED, n_jobs=-1)
+            rf.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], rf.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize',
+        storage=storage,
+        study_name='rf_ranker',
+        load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing RF ranker trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  RF ranker best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def optimize_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """
+    Use Optuna to find optimal GB affinity hyperparameters via 5-fold KFold CV.
+
+    One row per complex; regular KFold is appropriate (no grouping needed).
+    Objective: maximise mean neg-MSE on the ΔG (kcal/mol) target.
+
+    Args:
+        train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
+        feature_cols:      Feature column names.
+        n_trials:          Number of NEW Optuna trials to run.
+        storage:           SQLite URL for persisting/resuming trials, e.g.
+                           "sqlite:///output/optuna_studies.db". None = in-memory only.
+
+    Returns:
+        Dict of best hyperparameters found across all trials.
+    """
+    available_cols = [c for c in feature_cols if c in train_affinity_df.columns]
+    X = np.nan_to_num(train_affinity_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = train_affinity_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_categorical('n_estimators', [100, 200, 300, 500]),
+            'max_depth':        trial.suggest_categorical('max_depth', [3, 4, 5, 6, 7]),
+            'learning_rate':    trial.suggest_categorical('learning_rate', [0.01, 0.05, 0.1, 0.2]),
+            'subsample':        trial.suggest_categorical('subsample', [0.6, 0.7, 0.8, 0.9, 1.0]),
+            'min_samples_leaf': trial.suggest_categorical('min_samples_leaf', [1, 2, 5, 10]),
+        }
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            gb = GradientBoostingRegressor(**params, random_state=RANDOM_SEED)
+            gb.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], gb.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize',
+        storage=storage,
+        study_name='gb_affinity',
+        load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing GB affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  GB affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def train_rf_ranker(
+    train_df: pd.DataFrame,
+    hyperparams: Optional[Dict] = None
+) -> Tuple[RandomForestRegressor, List[str]]:
     """
     Train a Random Forest regressor as a pose ranker.
     Predicts 1/(1+rmsd) per pose; the pose with the highest predicted score is selected.
 
     Args:
-        train_df: DataFrame with pose-level features and rmsd column
+        train_df:    DataFrame with pose-level features and rmsd column.
+        hyperparams: Optional dict of hyperparameters to override the defaults
+                     (e.g. from optimize_ranker_hyperparams()).
 
     Returns:
         Tuple of (trained RandomForestRegressor, list of feature column names)
@@ -1066,24 +1189,24 @@ def train_rf_ranker(train_df: pd.DataFrame) -> Tuple[RandomForestRegressor, List
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y_rel = 1.0 / (1.0 + train_df['rmsd'].values)
 
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=10,
-        min_samples_leaf=5,
-        random_state=RANDOM_SEED,
-        n_jobs=-1,
-    )
+    params = {'n_estimators': 300, 'max_depth': 10, 'min_samples_leaf': 5,
+              **(hyperparams or {})}
+    model = RandomForestRegressor(**params, random_state=RANDOM_SEED, n_jobs=-1)
     model.fit(X, y_rel)
     return model, feature_cols
 
 
-def train_gb_ranker(train_df: pd.DataFrame) -> Tuple[GradientBoostingRegressor, List[str]]:
+def train_gb_ranker(
+    train_df: pd.DataFrame,
+    hyperparams: Optional[Dict] = None
+) -> Tuple[GradientBoostingRegressor, List[str]]:
     """
     Train a Gradient Boosting regressor as a pose ranker.
     Predicts 1/(1+rmsd) per pose; the pose with the highest predicted score is selected.
 
     Args:
-        train_df: DataFrame with pose-level features and rmsd column
+        train_df:    DataFrame with pose-level features and rmsd column.
+        hyperparams: Optional dict of hyperparameters to override the defaults.
 
     Returns:
         Tuple of (trained GradientBoostingRegressor, list of feature column names)
@@ -1095,14 +1218,9 @@ def train_gb_ranker(train_df: pd.DataFrame) -> Tuple[GradientBoostingRegressor, 
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y_rel = 1.0 / (1.0 + train_df['rmsd'].values)
 
-    model = GradientBoostingRegressor(
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        min_samples_leaf=5,
-        random_state=RANDOM_SEED,
-    )
+    params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
+              'subsample': 0.8, 'min_samples_leaf': 5, **(hyperparams or {})}
+    model = GradientBoostingRegressor(**params, random_state=RANDOM_SEED)
     model.fit(X, y_rel)
     return model, feature_cols
 
@@ -1437,7 +1555,8 @@ def prepare_affinity_data(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataF
 
 def train_affinity_model(
     train_affinity_df: pd.DataFrame,
-    feature_cols: List[str]
+    feature_cols: List[str],
+    hyperparams_gb: Optional[Dict] = None
 ) -> Dict:
     """
     Train RF and GB regressors to predict experimental binding affinity (ΔG, kcal/mol).
@@ -1445,6 +1564,8 @@ def train_affinity_model(
     Args:
         train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
         feature_cols:      Feature column names.
+        hyperparams_gb:    Optional dict of GB hyperparameters to override defaults
+                           (e.g. from optimize_affinity_hyperparams()).
 
     Returns:
         Dict mapping model name → (fitted model, feature_cols used):
@@ -1462,10 +1583,9 @@ def train_affinity_model(
     )
     rf.fit(X, y)
 
-    gb = GradientBoostingRegressor(
-        n_estimators=300, max_depth=5, learning_rate=0.05,
-        subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED
-    )
+    gb_params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
+                 'subsample': 0.8, 'min_samples_leaf': 5, **(hyperparams_gb or {})}
+    gb = GradientBoostingRegressor(**gb_params, random_state=RANDOM_SEED)
     gb.fit(X, y)
 
     print(f"  Trained affinity models on {len(train_affinity_df)} complexes, "
@@ -2172,6 +2292,24 @@ def main():
         action='store_true',
         help='Skip binding affinity prediction step (faster if only pose ranking is needed)'
     )
+    parser.add_argument(
+        '--optimize-hyperparams',
+        action='store_true',
+        help='Run Optuna hyperparameter search for RF ranker and GB affinity (~20 min extra)'
+    )
+    parser.add_argument(
+        '--n-trials',
+        type=int,
+        default=30,
+        help='Number of Optuna trials per model when --optimize-hyperparams is set (default: 30)'
+    )
+    parser.add_argument(
+        '--optuna-db',
+        type=str,
+        default=None,
+        help='Path to SQLite DB for saving/resuming Optuna trials '
+             '(e.g. output/optuna_studies.db). Omit to run in-memory only (no persistence).'
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -2240,16 +2378,27 @@ def main():
 
         print(f"  Feature count after augmentation: {train_df.shape[1]} columns")
 
+    # --- Optional: Optuna hyperparameter search for RF ranker ---
+    optuna_storage = f"sqlite:///{args.optuna_db}" if args.optuna_db else None
+    rf_hyperparams = None
+    if args.optimize_hyperparams:
+        feature_cols_for_opt = [c for c in train_df.columns
+                                if c not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
+        print(f"\nOptimising RF ranker hyperparameters "
+              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold)...")
+        rf_hyperparams = optimize_ranker_hyperparams(
+            train_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+        )
+        print(f"  Best RF params: {rf_hyperparams}")
+
     # --- Train all ranker models ---
-    models_to_train = {
-        'xgb_ranker': train_ranker_model,
-        'rf_ranker':  train_rf_ranker,
-        'gb_ranker':  train_gb_ranker,
-    }
     trained = {}
-    for name, train_fn in models_to_train.items():
-        print(f"\nTraining {name}...")
-        trained[name] = train_fn(train_df)  # returns (model, feature_cols)
+    print(f"\nTraining xgb_ranker...")
+    trained['xgb_ranker'] = train_ranker_model(train_df)
+    print(f"Training rf_ranker...")
+    trained['rf_ranker'] = train_rf_ranker(train_df, hyperparams=rf_hyperparams)
+    print(f"Training gb_ranker...")
+    trained['gb_ranker'] = train_gb_ranker(train_df)
 
     # --- Evaluate all individual models ---
     model_results = {}
@@ -2383,8 +2532,19 @@ def main():
         if len(train_aff) < 10 or len(test_aff) < 2:
             print("  Warning: Too few complexes with affinity labels. Skipping affinity models.")
         else:
+            gb_affinity_hyperparams = None
+            if args.optimize_hyperparams:
+                print(f"Optimising GB affinity hyperparameters "
+                      f"(Optuna, {args.n_trials} trials × 5-fold KFold)...")
+                gb_affinity_hyperparams = optimize_affinity_hyperparams(
+                    train_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                )
+                print(f"  Best GB affinity params: {gb_affinity_hyperparams}")
+
             print("Training affinity models...")
-            affinity_models = train_affinity_model(train_aff, feature_cols_aff)
+            affinity_models = train_affinity_model(
+                train_aff, feature_cols_aff, hyperparams_gb=gb_affinity_hyperparams
+            )
 
             print("Evaluating affinity models...")
             affinity_metrics = evaluate_affinity_model(affinity_models, test_aff, feature_cols_aff)
@@ -2409,6 +2569,16 @@ def main():
                 print(f"  Spearman r : {am['spearman_r']:+.3f}")
                 print(f"  RMSE       : {am['rmse']:.3f} kcal/mol")
                 print(f"  MAE        : {am['mae']:.3f} kcal/mol")
+
+            # Save best hyperparameters if optimisation was run
+            if args.optimize_hyperparams:
+                best_hp = {
+                    'rf_ranker':   rf_hyperparams or {},
+                    'gb_affinity': gb_affinity_hyperparams or {},
+                }
+                hp_path = OUTPUT_DIR / 'best_hyperparams.json'
+                hp_path.write_text(json.dumps(best_hp, indent=2))
+                print(f"\nSaved best hyperparameters to {hp_path}")
 
             print("\nExporting affinity predictions CSV...")
             export_affinity_predictions_csv(test_aff, affinity_metrics, OUTPUT_DIR)

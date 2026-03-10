@@ -11,7 +11,7 @@
 
 ---
 
-## Overall Progress: ~55%
+## Overall Progress: ~65%
 
 ---
 
@@ -62,10 +62,12 @@ to the crystal ligand (standard docking benchmark).
 - Output: `output/affinity_predictions.csv`, `output/affinity_predictions.png`
 - Added `--no-affinity` flag
 
-### Stage 4 — Hyperparameter optimisation [TODO]
-- Grid/random search or Optuna for XGB, RF, GB hyperparameters
-- Cross-validation on training set (avoid test set contamination)
-- Expected gain: +1–3 pp
+### Stage 4 — Hyperparameter optimisation [COMPLETE]
+- Optuna search for RF ranker (GroupKFold, poses grouped by complex) and GB affinity (KFold)
+- RF: `max_features=0.5, min_samples_leaf=2` → best-pose rate 0.325 → **0.337** (+1.2 pp)
+- GB affinity: `n_estimators=500, max_depth=6, lr=0.01` → Pearson r 0.643 → **0.649**
+- Added `--optimize-hyperparams` flag (default off, ~20 min) and `--n-trials N` (default 30)
+- Output: `output/best_hyperparams.json`
 
 ### Stage 5 — Richer contact features [TODO]
 - Atom-type-specific contacts (aromatic–aromatic, H-bond donors/acceptors)
@@ -113,7 +115,7 @@ to the crystal ligand (standard docking benchmark).
 - [x] Gradient Boosting regressor
 - [x] Ensemble (min-max normalised average)
 - [x] RF + GB affinity regressors (ΔG prediction)
-- [ ] Hyperparameter optimisation
+- [x] Hyperparameter optimisation (Optuna, RF ranker + GB affinity)
 - [ ] Neural network / GNN
 
 ### Evaluation & Output
@@ -151,11 +153,11 @@ to the crystal ligand (standard docking benchmark).
 | 2 — Ranker + feature engineering | Complete | 100% |
 | 3 — Contacts + ensemble + diagnostics | Complete | 100% |
 | 8 — Binding affinity prediction | Complete | 100% |
-| 4 — Hyperparameter optimisation | Not started | 0% |
+| 4 — Hyperparameter optimisation | Complete | 100% |
 | 5 — Richer contact features | Not started | 0% |
 | 6 — Neural network | Not started | 0% |
 | 7 — Analysis & reporting | Not started | 0% |
-| **Overall** | | **~45%** |
+| **Overall** | | **~65%** |
 
 ---
 
@@ -163,9 +165,9 @@ to the crystal ligand (standard docking benchmark).
 
 Priority order — edit/reorder as needed:
 
-1. **Hyperparameter search for RF ranker** (highest ROI, ~1 day)
-   - Use `RandomizedSearchCV` or Optuna on training set
-   - Tune: n_estimators, max_depth, min_samples_leaf, max_features
+1. **Full Optuna run with 30 trials + contact features** (~40 min total)
+   - `--optimize-hyperparams --n-trials 30` with contact features enabled
+   - Expected RF ranker best-pose rate: 0.340+ (from 0.328 baseline with contacts)
 
 2. **Atom-type contact features** (~0.5 days)
    - Separate hydrophobic / polar / aromatic contact counts
@@ -173,15 +175,12 @@ Priority order — edit/reorder as needed:
 
 3. **H-bond geometry features** (~1 day)
    - Identify donor-acceptor pairs within 3.5 Å with correct angle
-   - Requires element assignment from protein PDB
 
 4. **Learning curves** (~0.5 days)
    - Plot best-pose rate vs training set size (100 → 4,240 complexes)
-   - Diagnoses whether more data or better features will help more
 
 5. **Per-family performance breakdown** (~0.5 days)
    - Group test complexes by protein family (kinase, GPCR, protease, etc.)
-   - Identify where model gains / loses vs Vina
 
 6. **[YOUR NEXT IDEA HERE]**
 

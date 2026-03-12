@@ -615,6 +615,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with additional engineered features
     """
+    df = df.reset_index(drop=True)
     new_df = df.copy()
 
     boltzmann_probs = np.zeros(len(df))
@@ -1052,6 +1053,7 @@ def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]
 
 def optimize_ranker_hyperparams(
     train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
@@ -1059,11 +1061,14 @@ def optimize_ranker_hyperparams(
     """
     Use Optuna to find optimal RF ranker hyperparameters via 5-fold GroupKFold CV.
 
-    Poses from the same complex are always in the same fold (GroupKFold) to avoid
-    data leakage. Objective: maximise mean neg-MSE on the 1/(1+rmsd) target.
+    CV is run on the combined train+val data so Optuna sees more complexes. The final
+    model is still trained on train_df only. Poses from the same complex are always in
+    the same fold (GroupKFold) to avoid data leakage. Objective: maximise mean neg-MSE
+    on the 1/(1+rmsd) target.
 
     Args:
         train_df:     Per-pose training DataFrame (augmented).
+        val_df:       Per-pose validation DataFrame (augmented).
         feature_cols: Feature column names.
         n_trials:     Number of NEW Optuna trials to run.
         storage:      SQLite URL for persisting/resuming trials, e.g.
@@ -1072,10 +1077,11 @@ def optimize_ranker_hyperparams(
     Returns:
         Dict of best hyperparameters found across all trials.
     """
-    available_cols = [c for c in feature_cols if c in train_df.columns]
-    X = np.nan_to_num(train_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
-    y = 1.0 / (1.0 + train_df['rmsd'].values)
-    _, groups = np.unique(train_df['pdb_code'].values, return_inverse=True)
+    cv_df = pd.concat([train_df, val_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = 1.0 / (1.0 + cv_df['rmsd'].values)
+    _, groups = np.unique(cv_df['pdb_code'].values, return_inverse=True)
     gkf = GroupKFold(n_splits=5)
 
     def objective(trial):
@@ -1110,6 +1116,7 @@ def optimize_ranker_hyperparams(
 
 def optimize_affinity_hyperparams(
     train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
@@ -1117,11 +1124,13 @@ def optimize_affinity_hyperparams(
     """
     Use Optuna to find optimal GB affinity hyperparameters via 5-fold KFold CV.
 
-    One row per complex; regular KFold is appropriate (no grouping needed).
-    Objective: maximise mean neg-MSE on the ΔG (kcal/mol) target.
+    CV is run on the combined train+val data so Optuna sees more complexes. The final
+    model is still trained on train_affinity_df only. One row per complex; regular KFold
+    is appropriate (no grouping needed). Objective: maximise mean neg-MSE on ΔG target.
 
     Args:
         train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
+        val_affinity_df:   Per-complex validation DataFrame from prepare_affinity_data().
         feature_cols:      Feature column names.
         n_trials:          Number of NEW Optuna trials to run.
         storage:           SQLite URL for persisting/resuming trials, e.g.
@@ -1130,9 +1139,10 @@ def optimize_affinity_hyperparams(
     Returns:
         Dict of best hyperparameters found across all trials.
     """
-    available_cols = [c for c in feature_cols if c in train_affinity_df.columns]
-    X = np.nan_to_num(train_affinity_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
-    y = train_affinity_df['exp_affinity_kcal_mol'].values
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
     kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
 
     def objective(trial):
@@ -1646,15 +1656,34 @@ def evaluate_affinity_model(
     return results
 
 
-def plot_affinity_predictions(affinity_metrics: Dict, output_dir: Path) -> None:
+def plot_affinity_predictions(
+    affinity_metrics: Dict,
+    output_dir: Path,
+    split: str = 'test',
+) -> None:
     """
     Side-by-side scatter: Vina score vs exp ΔG (left), best ML model vs exp ΔG (right).
     Points coloured by rank-1 pose RMSD (0–10 Å, RdYlGn_r colourmap).
+    Both subplots share the same x/y axis limits for direct comparison.
+
+    Args:
+        affinity_metrics: Dict from evaluate_affinity_model().
+        output_dir:       Directory to save the plot.
+        split:            'test' or 'val' — controls filename and figure title.
     """
     ml_names = [k for k in affinity_metrics if k != 'vina_baseline']
     best_ml_name = max(ml_names, key=lambda k: affinity_metrics[k]['pearson_r'])
 
+    # Compute shared axis limits across both models
+    all_vals = []
+    for name in ['vina_baseline', best_ml_name]:
+        m = affinity_metrics[name]
+        all_vals.extend([m['y_true'], m['y_pred']])
+    shared_lims = [min(v.min() for v in all_vals) - 0.5,
+                   max(v.max() for v in all_vals) + 0.5]
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle(f'Binding Affinity Predictions ({split.capitalize()} set)', fontsize=13)
     sc = None
     for ax, name in zip(axes, ['vina_baseline', best_ml_name]):
         m = affinity_metrics[name]
@@ -1665,11 +1694,9 @@ def plot_affinity_predictions(affinity_metrics: Dict, output_dir: Path) -> None:
         sc = ax.scatter(y_true, y_pred, c=rmsd_colors, cmap='RdYlGn_r',
                         vmin=0, vmax=10, alpha=0.6, s=20, edgecolors='none')
 
-        lims = [min(y_true.min(), y_pred.min()) - 0.5,
-                max(y_true.max(), y_pred.max()) + 0.5]
-        ax.plot(lims, lims, 'k--', lw=1, alpha=0.5)
-        ax.set_xlim(lims)
-        ax.set_ylim(lims)
+        ax.plot(shared_lims, shared_lims, 'k--', lw=1, alpha=0.5)
+        ax.set_xlim(shared_lims)
+        ax.set_ylim(shared_lims)
 
         label = 'Vina score' if name == 'vina_baseline' else name
         ax.set_xlabel('Experimental ΔG (kcal/mol)', fontsize=12)
@@ -1685,7 +1712,7 @@ def plot_affinity_predictions(affinity_metrics: Dict, output_dir: Path) -> None:
     if sc is not None:
         plt.colorbar(sc, ax=axes[1], label='Rank-1 pose RMSD (Å)')
     plt.tight_layout()
-    out_path = output_dir / 'affinity_predictions.png'
+    out_path = output_dir / f'affinity_predictions_{split}.png'
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved affinity scatter plot to {out_path}")
@@ -2179,29 +2206,68 @@ def export_score_comparison_csv(model_results: Dict, output_dir: Path) -> None:
         print(f"  {label} selects correct pose: {metrics['xgb_success_rate']:.3f}")
 
 
-def load_data_from_csv(train_csv: Path, test_csv: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_data_from_csv(
+    train_csv: Path,
+    test_csv: Path,
+    val_csv: Optional[Path] = None,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], pd.DataFrame]:
     """
-    Load existing training and test data from CSV files.
-    
+    Load existing training, validation (optional), and test data from CSV files.
+
     Args:
         train_csv: Path to training data CSV
-        test_csv: Path to test data CSV
-    
+        test_csv:  Path to test data CSV
+        val_csv:   Optional path to validation data CSV
+
     Returns:
-        Tuple of (train_df, test_df)
+        Tuple of (train_df, val_df or None, test_df)
     """
     if not train_csv.exists():
         raise FileNotFoundError(f"Training CSV not found: {train_csv}")
     if not test_csv.exists():
         raise FileNotFoundError(f"Test CSV not found: {test_csv}")
-    
+
     train_df = pd.read_csv(train_csv)
-    test_df = pd.read_csv(test_csv)
-    
+    test_df  = pd.read_csv(test_csv)
+    val_df   = None
+    if val_csv is not None:
+        if not val_csv.exists():
+            raise FileNotFoundError(f"Validation CSV not found: {val_csv}")
+        val_df = pd.read_csv(val_csv)
+        print(f"Loaded validation data: {val_df.shape}")
+
     print(f"Loaded training data: {train_df.shape}")
     print(f"Loaded test data: {test_df.shape}")
-    
-    return train_df, test_df
+
+    return train_df, val_df, test_df
+
+
+def split_val_from_train(
+    train_df: pd.DataFrame,
+    val_frac: float = 0.2,
+    random_seed: int = RANDOM_SEED,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Carve out a validation set from the training DataFrame by complex.
+
+    Complexes (not individual poses) are split to avoid data leakage.
+
+    Args:
+        train_df:    Per-pose training DataFrame with 'pdb_code' column.
+        val_frac:    Fraction of complexes to use for validation (default 0.2).
+        random_seed: Random seed for reproducibility.
+
+    Returns:
+        Tuple of (reduced_train_df, val_df).
+    """
+    unique = train_df['pdb_code'].unique()
+    train_codes, val_codes = train_test_split(
+        unique, test_size=val_frac, random_state=random_seed
+    )
+    return (
+        train_df[train_df['pdb_code'].isin(train_codes)].copy(),
+        train_df[train_df['pdb_code'].isin(val_codes)].copy(),
+    )
 
 
 def process_all_complexes(num_complexes: Optional[int] = None) -> List[Dict]:
@@ -2261,9 +2327,19 @@ def main():
     )
     parser.add_argument(
         '--load-csv',
-        nargs=2,
-        metavar=('TRAIN_CSV', 'TEST_CSV'),
-        help='Load existing training and test CSV files instead of running Vina'
+        nargs='+',
+        metavar='CSV',
+        help='Load existing CSV files instead of running Vina. '
+             'Provide TRAIN_CSV TEST_CSV [VAL_CSV]. '
+             'If VAL_CSV is omitted, a validation set is carved from TRAIN_CSV '
+             'using --val-frac.'
+    )
+    parser.add_argument(
+        '--val-frac',
+        type=float,
+        default=0.2,
+        help='Fraction of training complexes to reserve as validation set '
+             'when VAL_CSV is not supplied via --load-csv (default: 0.2)'
     )
     parser.add_argument(
         '--num-complexes',
@@ -2310,6 +2386,15 @@ def main():
         help='Path to SQLite DB for saving/resuming Optuna trials '
              '(e.g. output/optuna_studies.db). Omit to run in-memory only (no persistence).'
     )
+    parser.add_argument(
+        '--load-hyperparams',
+        type=str,
+        default=None,
+        metavar='JSON_PATH',
+        help='Load previously optimised hyperparameters from a JSON file and apply them '
+             'without running Optuna (e.g. output/best_hyperparams.json). '
+             'If --optimize-hyperparams is also set, Optuna runs and overwrites these.'
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -2318,9 +2403,21 @@ def main():
     if args.load_csv:
         # Load existing CSV files
         print("Loading data from CSV files...")
-        train_csv = Path(args.load_csv[0])
-        test_csv = Path(args.load_csv[1])
-        train_df, test_df = load_data_from_csv(train_csv, test_csv)
+        csvs = args.load_csv
+        val_csv = Path(csvs[2]) if len(csvs) >= 3 else None
+        train_df, val_df, test_df = load_data_from_csv(
+            Path(csvs[0]), Path(csvs[1]), val_csv
+        )
+        if val_df is None:
+            train_df, val_df = split_val_from_train(train_df, args.val_frac)
+            print(f"  Val set carved from training data: "
+                  f"{val_df['pdb_code'].nunique()} complexes "
+                  f"({val_df.shape[0]} poses)")
+            val_df.to_csv(OUTPUT_DIR / "val_data.csv", index=False)
+            print(f"  Saved val set to {OUTPUT_DIR / 'val_data.csv'}")
+            print(f"  Remaining training: "
+                  f"{train_df['pdb_code'].nunique()} complexes "
+                  f"({train_df.shape[0]} poses)")
     else:
         # Process complexes with Vina
         num_complexes = args.num_complexes
@@ -2337,17 +2434,22 @@ def main():
             print("Not enough data for training")
             return
 
-        # Split data by complex (not by pose) to avoid data leakage
+        # Split data by complex (not by pose): train / val / test
         unique_complexes = train_df['pdb_code'].unique()
-        train_complexes, test_complexes = train_test_split(
+        remaining_complexes, test_complexes = train_test_split(
             unique_complexes, test_size=0.2, random_state=RANDOM_SEED
         )
+        train_complexes, val_complexes = train_test_split(
+            remaining_complexes, test_size=0.2, random_state=RANDOM_SEED
+        )
 
-        train_df_final = train_df[train_df['pdb_code'].isin(train_complexes)]
-        test_df = train_df[train_df['pdb_code'].isin(test_complexes)]
+        train_df_final = train_df[train_df['pdb_code'].isin(train_complexes)].copy()
+        val_df         = train_df[train_df['pdb_code'].isin(val_complexes)].copy()
+        test_df        = train_df[train_df['pdb_code'].isin(test_complexes)].copy()
 
         # Save results
         train_df_final.to_csv(OUTPUT_DIR / "training_data.csv", index=False)
+        val_df.to_csv(OUTPUT_DIR / "val_data.csv", index=False)
         test_df.to_csv(OUTPUT_DIR / "test_data.csv", index=False)
         print(f"Results saved to {OUTPUT_DIR}")
 
@@ -2359,35 +2461,56 @@ def main():
 
         print("  Adding pose geometry from PDBQT files...")
         train_df = augment_with_pdbqt_features(train_df)
-        test_df = augment_with_pdbqt_features(test_df)
+        val_df   = augment_with_pdbqt_features(val_df)
+        test_df  = augment_with_pdbqt_features(test_df)
 
         print("  Adding molecular descriptors from mol2 files...")
         train_df = augment_with_mol2_features(train_df)
-        test_df = augment_with_mol2_features(test_df)
+        val_df   = augment_with_mol2_features(val_df)
+        test_df  = augment_with_mol2_features(test_df)
 
         if not args.no_contact_features:
             print("  Adding protein-ligand contact features (may take ~5-10 min)...")
             train_df = augment_with_contact_features(train_df)
-            test_df = augment_with_contact_features(test_df)
+            val_df   = augment_with_contact_features(val_df)
+            test_df  = augment_with_contact_features(test_df)
         else:
             print("  Skipping protein-ligand contact features (--no-contact-features set)")
 
         print("  Engineering derived features...")
         train_df = engineer_features(train_df)
-        test_df = engineer_features(test_df)
+        val_df   = engineer_features(val_df)
+        test_df  = engineer_features(test_df)
 
         print(f"  Feature count after augmentation: {train_df.shape[1]} columns")
 
-    # --- Optional: Optuna hyperparameter search for RF ranker ---
+    # --- Load pre-computed hyperparameters if requested ---
     optuna_storage = f"sqlite:///{args.optuna_db}" if args.optuna_db else None
-    rf_hyperparams = None
+    rf_hyperparams      = None
+    gb_affinity_preload = None
+    if args.load_hyperparams:
+        hp_path = Path(args.load_hyperparams)
+        if not hp_path.exists():
+            print(f"Warning: --load-hyperparams file not found: {hp_path}. Using defaults.")
+        else:
+            loaded_hp = json.loads(hp_path.read_text())
+            rf_hyperparams      = loaded_hp.get('rf_ranker', {}) or None
+            gb_affinity_preload = loaded_hp.get('gb_affinity', {}) or None
+            print(f"Loaded hyperparameters from {hp_path}")
+            if rf_hyperparams:
+                print(f"  RF ranker  : {rf_hyperparams}")
+            if gb_affinity_preload:
+                print(f"  GB affinity: {gb_affinity_preload}")
+
+    # --- Optional: Optuna hyperparameter search for RF ranker ---
+    # (overwrites loaded params if --optimize-hyperparams is also set)
     if args.optimize_hyperparams:
         feature_cols_for_opt = [c for c in train_df.columns
                                 if c not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
         print(f"\nOptimising RF ranker hyperparameters "
-              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold)...")
+              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
         rf_hyperparams = optimize_ranker_hyperparams(
-            train_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
         )
         print(f"  Best RF params: {rf_hyperparams}")
 
@@ -2400,15 +2523,20 @@ def main():
     print(f"Training gb_ranker...")
     trained['gb_ranker'] = train_gb_ranker(train_df)
 
-    # --- Evaluate all individual models ---
+    # --- Evaluate all individual models on test and val sets ---
     model_results = {}
+    val_results = {}
     for name, (model, feat_cols) in trained.items():
-        print(f"Evaluating {name}...")
+        print(f"Evaluating {name} (test)...")
         model_results[name] = evaluate_ranker(model, test_df, feat_cols)
+        print(f"Evaluating {name} (val)...")
+        val_results[name] = evaluate_ranker(model, val_df, feat_cols)
 
     # --- Ensemble: average normalised scores from all three rankers ---
-    print("Evaluating ensemble...")
+    print("Evaluating ensemble (test)...")
     model_results['ensemble'] = evaluate_ensemble(model_results, test_df)
+    print("Evaluating ensemble (val)...")
+    val_results['ensemble'] = evaluate_ensemble(val_results, val_df)
 
     # Choose best model by 2 Å success rate (tie-break: best-pose selection rate)
     best_name = max(
@@ -2420,28 +2548,38 @@ def main():
     best_model, _ = trained[best_name]
 
     # --- Print results ---
-    n = best_metrics['total_complexes']
+    n_test = best_metrics['total_complexes']
+    n_val  = val_results[best_name]['total_complexes']
     print(f"\n{'='*60}")
     print("POSE SELECTION PERFORMANCE")
     print(f"{'='*60}")
-    print(f"Total test complexes: {n}")
+    print(f"Test complexes : {n_test}   Val complexes : {n_val}")
     print(f"\nAutoDock Vina (baseline):")
-    print(f"  Best-pose selection rate : {best_metrics['vina_success_rate']:.3f} "
-          f"({best_metrics['vina_success_count']}/{n})")
-    print(f"  Poses within 2 Å        : {best_metrics['vina_success_2A_rate']:.3f} "
-          f"({best_metrics['vina_success_2A_count']}/{n})")
-    print(f"  Mean RMSD of selected   : {best_metrics['mean_vina_rmsd']:.3f} Å")
+    print(f"  Best-pose selection rate : "
+          f"val={val_results[best_name]['vina_success_rate']:.3f}  "
+          f"test={best_metrics['vina_success_rate']:.3f}")
+    print(f"  Poses within 2 Å        : "
+          f"val={val_results[best_name]['vina_success_2A_rate']:.3f}  "
+          f"test={best_metrics['vina_success_2A_rate']:.3f}")
+    print(f"  Mean RMSD of selected   : "
+          f"val={val_results[best_name]['mean_vina_rmsd']:.3f}  "
+          f"test={best_metrics['mean_vina_rmsd']:.3f} Å")
 
     for name, metrics in model_results.items():
+        vm = val_results[name]
         print(f"\n--- {name} ---")
-        print(f"  Best-pose selection rate : {metrics['xgb_success_rate']:.3f} "
-              f"({metrics['xgb_success_count']}/{n})")
-        print(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
-              f"({metrics['xgb_success_2A_count']}/{n})")
-        print(f"  Mean/Median RMSD        : {metrics['mean_xgb_rmsd']:.3f} / "
-              f"{metrics['median_xgb_rmsd']:.3f} Å")
-        print(f"  RMSD improvement vs Vina: {metrics['mean_rmsd_improvement']:+.3f} Å")
-        print(f"  Spearman score–RMSD corr: {metrics['spearman_mean']:.3f}")
+        print(f"  Best-pose selection rate : "
+              f"val={vm['xgb_success_rate']:.3f}  test={metrics['xgb_success_rate']:.3f}")
+        print(f"  Poses within 2 Å        : "
+              f"val={vm['xgb_success_2A_rate']:.3f}  test={metrics['xgb_success_2A_rate']:.3f}")
+        print(f"  Mean/Median RMSD        : "
+              f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
+              f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å")
+        print(f"  RMSD improvement vs Vina: "
+              f"val={vm['mean_rmsd_improvement']:+.3f}  "
+              f"test={metrics['mean_rmsd_improvement']:+.3f} Å")
+        print(f"  Spearman score–RMSD corr: "
+              f"val={vm['spearman_mean']:.3f}  test={metrics['spearman_mean']:.3f}")
 
     print(f"\n{'='*60}")
     print(f"Best model: {best_name}")
@@ -2452,23 +2590,36 @@ def main():
         f.write("=" * 60 + "\n")
         f.write("POSE SELECTION PERFORMANCE METRICS\n")
         f.write("=" * 60 + "\n\n")
-        f.write(f"Total test complexes: {n}\n\n")
+        f.write(f"Val complexes : {n_val}   Test complexes : {n_test}\n\n")
         f.write("AutoDock Vina (baseline):\n")
-        f.write(f"  Best-pose selection rate : {best_metrics['vina_success_rate']:.3f} "
-                f"({best_metrics['vina_success_count']}/{n})\n")
-        f.write(f"  Poses within 2 Å        : {best_metrics['vina_success_2A_rate']:.3f} "
-                f"({best_metrics['vina_success_2A_count']}/{n})\n")
-        f.write(f"  Mean RMSD               : {best_metrics['mean_vina_rmsd']:.3f} Å\n\n")
+        _bv = val_results[best_name]
+        f.write(f"  Best-pose selection rate : "
+                f"val={_bv['vina_success_rate']:.3f}  "
+                f"test={best_metrics['vina_success_rate']:.3f}\n")
+        f.write(f"  Poses within 2 Å        : "
+                f"val={_bv['vina_success_2A_rate']:.3f}  "
+                f"test={best_metrics['vina_success_2A_rate']:.3f}\n")
+        f.write(f"  Mean RMSD               : "
+                f"val={_bv['mean_vina_rmsd']:.3f}  "
+                f"test={best_metrics['mean_vina_rmsd']:.3f} Å\n\n")
         for name, metrics in model_results.items():
+            vm = val_results[name]
             f.write(f"{name}{'  <-- best' if name == best_name else ''}:\n")
-            f.write(f"  Best-pose selection rate : {metrics['xgb_success_rate']:.3f} "
-                    f"({metrics['xgb_success_count']}/{n})\n")
-            f.write(f"  Poses within 2 Å        : {metrics['xgb_success_2A_rate']:.3f} "
-                    f"({metrics['xgb_success_2A_count']}/{n})\n")
-            f.write(f"  Mean/Median RMSD        : {metrics['mean_xgb_rmsd']:.3f} / "
-                    f"{metrics['median_xgb_rmsd']:.3f} Å\n")
-            f.write(f"  RMSD improvement vs Vina: {metrics['mean_rmsd_improvement']:+.3f} Å\n")
-            f.write(f"  Spearman score-RMSD corr: {metrics['spearman_mean']:.3f}\n\n")
+            f.write(f"  Best-pose selection rate : "
+                    f"val={vm['xgb_success_rate']:.3f}  "
+                    f"test={metrics['xgb_success_rate']:.3f}\n")
+            f.write(f"  Poses within 2 Å        : "
+                    f"val={vm['xgb_success_2A_rate']:.3f}  "
+                    f"test={metrics['xgb_success_2A_rate']:.3f}\n")
+            f.write(f"  Mean/Median RMSD        : "
+                    f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
+                    f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å\n")
+            f.write(f"  RMSD improvement vs Vina: "
+                    f"val={vm['mean_rmsd_improvement']:+.3f}  "
+                    f"test={metrics['mean_rmsd_improvement']:+.3f} Å\n")
+            f.write(f"  Spearman score-RMSD corr: "
+                    f"val={vm['spearman_mean']:.3f}  "
+                    f"test={metrics['spearman_mean']:.3f}\n\n")
 
     print(f"Saved metrics to {metrics_file}")
 
@@ -2519,6 +2670,7 @@ def main():
 
         print("\nJoining affinity labels...")
         train_df_aff = join_affinity_labels(train_df)
+        val_df_aff   = join_affinity_labels(val_df)
         test_df_aff  = join_affinity_labels(test_df)
 
         _aff_exclude = {'pdb_code', 'pose_idx', 'is_best_pose', 'rmsd',
@@ -2527,17 +2679,18 @@ def main():
 
         print("Preparing affinity datasets...")
         train_aff = prepare_affinity_data(train_df_aff, feature_cols_aff)
+        val_aff   = prepare_affinity_data(val_df_aff,   feature_cols_aff)
         test_aff  = prepare_affinity_data(test_df_aff,  feature_cols_aff)
 
         if len(train_aff) < 10 or len(test_aff) < 2:
             print("  Warning: Too few complexes with affinity labels. Skipping affinity models.")
         else:
-            gb_affinity_hyperparams = None
+            gb_affinity_hyperparams = gb_affinity_preload  # None unless --load-hyperparams
             if args.optimize_hyperparams:
                 print(f"Optimising GB affinity hyperparameters "
-                      f"(Optuna, {args.n_trials} trials × 5-fold KFold)...")
+                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
                 gb_affinity_hyperparams = optimize_affinity_hyperparams(
-                    train_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
                 )
                 print(f"  Best GB affinity params: {gb_affinity_hyperparams}")
 
@@ -2546,29 +2699,34 @@ def main():
                 train_aff, feature_cols_aff, hyperparams_gb=gb_affinity_hyperparams
             )
 
-            print("Evaluating affinity models...")
+            print("Evaluating affinity models (test)...")
             affinity_metrics = evaluate_affinity_model(affinity_models, test_aff, feature_cols_aff)
+            print("Evaluating affinity models (val)...")
+            val_affinity_metrics = evaluate_affinity_model(affinity_models, val_aff, feature_cols_aff)
 
-            n_aff = len(test_aff)
+            n_aff_test = len(test_aff)
+            n_aff_val  = len(val_aff)
             print(f"\n{'='*60}")
             print("BINDING AFFINITY PERFORMANCE")
             print(f"{'='*60}")
-            print(f"Test complexes with affinity labels: {n_aff}")
+            print(f"Val complexes: {n_aff_val}   Test complexes: {n_aff_test}")
 
             print(f"\nVina baseline (rank-1 score vs exp ΔG):")
-            vm = affinity_metrics['vina_baseline']
-            print(f"  Pearson r  : {vm['pearson_r']:+.3f}")
-            print(f"  Spearman r : {vm['spearman_r']:+.3f}")
-            print(f"  RMSE       : {vm['rmse']:.3f} kcal/mol")
-            print(f"  MAE        : {vm['mae']:.3f} kcal/mol")
+            vm_t = affinity_metrics['vina_baseline']
+            vm_v = val_affinity_metrics['vina_baseline']
+            print(f"  Pearson r  : val={vm_v['pearson_r']:+.3f}  test={vm_t['pearson_r']:+.3f}")
+            print(f"  Spearman r : val={vm_v['spearman_r']:+.3f}  test={vm_t['spearman_r']:+.3f}")
+            print(f"  RMSE       : val={vm_v['rmse']:.3f}  test={vm_t['rmse']:.3f} kcal/mol")
+            print(f"  MAE        : val={vm_v['mae']:.3f}  test={vm_t['mae']:.3f} kcal/mol")
 
             for name in sorted(k for k in affinity_metrics if k != 'vina_baseline'):
-                am = affinity_metrics[name]
+                am_t = affinity_metrics[name]
+                am_v = val_affinity_metrics[name]
                 print(f"\n--- {name} ---")
-                print(f"  Pearson r  : {am['pearson_r']:+.3f}")
-                print(f"  Spearman r : {am['spearman_r']:+.3f}")
-                print(f"  RMSE       : {am['rmse']:.3f} kcal/mol")
-                print(f"  MAE        : {am['mae']:.3f} kcal/mol")
+                print(f"  Pearson r  : val={am_v['pearson_r']:+.3f}  test={am_t['pearson_r']:+.3f}")
+                print(f"  Spearman r : val={am_v['spearman_r']:+.3f}  test={am_t['spearman_r']:+.3f}")
+                print(f"  RMSE       : val={am_v['rmse']:.3f}  test={am_t['rmse']:.3f} kcal/mol")
+                print(f"  MAE        : val={am_v['mae']:.3f}  test={am_t['mae']:.3f} kcal/mol")
 
             # Save best hyperparameters if optimisation was run
             if args.optimize_hyperparams:
@@ -2584,9 +2742,10 @@ def main():
             export_affinity_predictions_csv(test_aff, affinity_metrics, OUTPUT_DIR)
 
             if not args.no_plots:
-                print("Generating affinity scatter plot...")
+                print("Generating affinity scatter plots (test + val)...")
                 try:
-                    plot_affinity_predictions(affinity_metrics, OUTPUT_DIR)
+                    plot_affinity_predictions(affinity_metrics,     OUTPUT_DIR, split='test')
+                    plot_affinity_predictions(val_affinity_metrics, OUTPUT_DIR, split='val')
                 except Exception as e:
                     print(f"Warning: Could not generate affinity plot: {e}")
     else:

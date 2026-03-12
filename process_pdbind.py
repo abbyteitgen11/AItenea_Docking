@@ -1004,7 +1004,10 @@ def train_rescoring_model(train_df: pd.DataFrame) -> xgb.XGBClassifier:
     return model
 
 
-def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]]:
+def train_ranker_model(
+    train_df: pd.DataFrame,
+    hyperparams: Optional[Dict] = None,
+) -> Tuple[xgb.XGBRanker, List[str]]:
     """
     Train XGBoost ranker to order poses within each complex by predicted quality.
     Uses continuous RMSD-based relevance (1/(1+rmsd)) so the model learns to
@@ -1012,6 +1015,7 @@ def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]
 
     Args:
         train_df: DataFrame with pose-level features and rmsd column
+        hyperparams: Optional dict of hyperparameters to override defaults
 
     Returns:
         Tuple of (trained XGBRanker, list of feature column names)
@@ -1032,16 +1036,20 @@ def train_ranker_model(train_df: pd.DataFrame) -> Tuple[xgb.XGBRanker, List[str]
     pdb_codes = sorted_df['pdb_code'].values
     _, qid = np.unique(pdb_codes, return_inverse=True)
 
+    params = {
+        'objective': 'rank:pairwise',
+        'n_estimators': 300,
+        'max_depth': 5,
+        'learning_rate': 0.05,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 3,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        **(hyperparams or {}),
+    }
     ranker = xgb.XGBRanker(
-        objective='rank:pairwise',
-        n_estimators=300,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=3,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+        **params,
         random_state=RANDOM_SEED,
         n_jobs=-1,
     )
@@ -1110,6 +1118,128 @@ def optimize_ranker_hyperparams(
         print(f"  Loaded {n_existing} existing RF ranker trials from storage")
     study.optimize(objective, n_trials=n_trials)
     print(f"  RF ranker best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def optimize_gb_ranker_hyperparams(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """
+    Use Optuna to find optimal GB ranker hyperparameters via 5-fold GroupKFold CV.
+
+    CV is run on the combined train+val data. Objective: maximise mean neg-MSE
+    on the 1/(1+rmsd) target. study_name='gb_ranker'.
+    """
+    cv_df = pd.concat([train_df, val_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = 1.0 / (1.0 + cv_df['rmsd'].values)
+    _, groups = np.unique(cv_df['pdb_code'].values, return_inverse=True)
+    gkf = GroupKFold(n_splits=5)
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_categorical('n_estimators', [100, 200, 300, 500]),
+            'max_depth':        trial.suggest_categorical('max_depth', [3, 4, 5, 6, 7]),
+            'learning_rate':    trial.suggest_categorical('learning_rate', [0.01, 0.05, 0.1, 0.2]),
+            'subsample':        trial.suggest_categorical('subsample', [0.6, 0.7, 0.8, 0.9, 1.0]),
+            'min_samples_leaf': trial.suggest_categorical('min_samples_leaf', [1, 2, 5, 10]),
+        }
+        scores = []
+        for train_idx, val_idx in gkf.split(X, y, groups=groups):
+            gb = GradientBoostingRegressor(**params, random_state=RANDOM_SEED)
+            gb.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], gb.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize',
+        storage=storage,
+        study_name='gb_ranker',
+        load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing GB ranker trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  GB ranker best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def optimize_xgb_ranker_hyperparams(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """
+    Use Optuna to find optimal XGBRanker hyperparameters via 5-fold GroupKFold CV.
+
+    CV is run on the combined train+val data. XGBRanker (rank:pairwise) is used for
+    training; scoring uses neg-MSE on 1/(1+rmsd) (same proxy as RF/GB).
+    study_name='xgb_ranker'.
+    """
+    cv_df = pd.concat([train_df, val_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    # Sort by pdb_code so qid groups are contiguous
+    cv_df = cv_df.sort_values('pdb_code').reset_index(drop=True)
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = 1.0 / (1.0 + cv_df['rmsd'].values)
+    _, groups = np.unique(cv_df['pdb_code'].values, return_inverse=True)
+    gkf = GroupKFold(n_splits=5)
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_categorical('n_estimators', [100, 200, 300, 500]),
+            'max_depth':        trial.suggest_categorical('max_depth', [3, 4, 5, 6, 7]),
+            'learning_rate':    trial.suggest_categorical('learning_rate', [0.01, 0.05, 0.1, 0.2]),
+            'subsample':        trial.suggest_categorical('subsample', [0.6, 0.7, 0.8, 0.9]),
+            'colsample_bytree': trial.suggest_categorical('colsample_bytree', [0.6, 0.7, 0.8, 0.9]),
+            'min_child_weight': trial.suggest_categorical('min_child_weight', [1, 3, 5, 7]),
+        }
+        scores = []
+        for train_idx, val_idx in gkf.split(X, y, groups=groups):
+            # Build contiguous qid for training fold
+            train_groups = groups[train_idx]
+            _, qid_train = np.unique(train_groups, return_inverse=True)
+            # Sort training fold by pdb_code for XGBRanker
+            sort_order = np.argsort(train_groups, kind='stable')
+            X_tr = X[train_idx][sort_order]
+            y_tr = y[train_idx][sort_order]
+            qid_tr = qid_train[sort_order]
+
+            ranker = xgb.XGBRanker(
+                objective='rank:pairwise',
+                random_state=RANDOM_SEED,
+                n_jobs=-1,
+                verbosity=0,
+                **params,
+            )
+            ranker.fit(X_tr, y_tr, qid=qid_tr)
+            pred = ranker.predict(X[val_idx])
+            scores.append(-mean_squared_error(y[val_idx], pred))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize',
+        storage=storage,
+        study_name='xgb_ranker',
+        load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing XGB ranker trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  XGB ranker best CV score: {study.best_value:.6f} "
           f"(over {len(study.trials)} total trials)")
     return study.best_params
 
@@ -2487,6 +2617,8 @@ def main():
     # --- Load pre-computed hyperparameters if requested ---
     optuna_storage = f"sqlite:///{args.optuna_db}" if args.optuna_db else None
     rf_hyperparams      = None
+    gb_hyperparams      = None
+    xgb_hyperparams     = None
     gb_affinity_preload = None
     if args.load_hyperparams:
         hp_path = Path(args.load_hyperparams)
@@ -2495,10 +2627,16 @@ def main():
         else:
             loaded_hp = json.loads(hp_path.read_text())
             rf_hyperparams      = loaded_hp.get('rf_ranker', {}) or None
+            gb_hyperparams      = loaded_hp.get('gb_ranker', {}) or None
+            xgb_hyperparams     = loaded_hp.get('xgb_ranker', {}) or None
             gb_affinity_preload = loaded_hp.get('gb_affinity', {}) or None
             print(f"Loaded hyperparameters from {hp_path}")
             if rf_hyperparams:
                 print(f"  RF ranker  : {rf_hyperparams}")
+            if gb_hyperparams:
+                print(f"  GB ranker  : {gb_hyperparams}")
+            if xgb_hyperparams:
+                print(f"  XGB ranker : {xgb_hyperparams}")
             if gb_affinity_preload:
                 print(f"  GB affinity: {gb_affinity_preload}")
 
@@ -2514,14 +2652,28 @@ def main():
         )
         print(f"  Best RF params: {rf_hyperparams}")
 
+        print(f"\nOptimising GB ranker hyperparameters "
+              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
+        gb_hyperparams = optimize_gb_ranker_hyperparams(
+            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+        )
+        print(f"  Best GB params: {gb_hyperparams}")
+
+        print(f"\nOptimising XGB ranker hyperparameters "
+              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
+        xgb_hyperparams = optimize_xgb_ranker_hyperparams(
+            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+        )
+        print(f"  Best XGB params: {xgb_hyperparams}")
+
     # --- Train all ranker models ---
     trained = {}
     print(f"\nTraining xgb_ranker...")
-    trained['xgb_ranker'] = train_ranker_model(train_df)
+    trained['xgb_ranker'] = train_ranker_model(train_df, hyperparams=xgb_hyperparams)
     print(f"Training rf_ranker...")
     trained['rf_ranker'] = train_rf_ranker(train_df, hyperparams=rf_hyperparams)
     print(f"Training gb_ranker...")
-    trained['gb_ranker'] = train_gb_ranker(train_df)
+    trained['gb_ranker'] = train_gb_ranker(train_df, hyperparams=gb_hyperparams)
 
     # --- Evaluate all individual models on test and val sets ---
     model_results = {}
@@ -2732,6 +2884,8 @@ def main():
             if args.optimize_hyperparams:
                 best_hp = {
                     'rf_ranker':   rf_hyperparams or {},
+                    'gb_ranker':   gb_hyperparams or {},
+                    'xgb_ranker':  xgb_hyperparams or {},
                     'gb_affinity': gb_affinity_hyperparams or {},
                 }
                 hp_path = OUTPUT_DIR / 'best_hyperparams.json'

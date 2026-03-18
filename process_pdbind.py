@@ -10,6 +10,7 @@ Workflow:
 4. Train XGBoost model to rescore Vina poses
 """
 
+import math
 import os
 import re
 import subprocess
@@ -22,6 +23,10 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, AllChem
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
 import json
 import optuna
 from sklearn.model_selection import train_test_split, GroupKFold, KFold
@@ -294,7 +299,56 @@ def extract_pose_coordinates(pdbqt_file: Path) -> List[np.ndarray]:
     # Add last pose if file doesn't end with ENDMDL
     if current_pose_atoms:
         poses.append(np.array(current_pose_atoms))
-    
+
+    return poses
+
+
+def extract_pose_atoms(pdbqt_file: Path) -> List[Tuple[np.ndarray, List[str]]]:
+    """
+    Extract atom coordinates and AutoDock atom types for each pose from a Vina PDBQT file.
+
+    Returns:
+        List of (coords_array, atom_types_list) per pose; HD (donor hydrogen) atoms excluded.
+    """
+    poses: List[Tuple[np.ndarray, List[str]]] = []
+    current_coords: List[List[float]] = []
+    current_types: List[str] = []
+
+    try:
+        with open(pdbqt_file, 'r') as f:
+            for line in f:
+                line = line.rstrip()
+                if line.startswith('MODEL'):
+                    current_coords = []
+                    current_types = []
+                elif line.startswith('ENDMDL'):
+                    if current_coords:
+                        poses.append((np.array(current_coords, dtype=np.float32), current_types))
+                    current_coords = []
+                    current_types = []
+                elif line.startswith('ATOM') or line.startswith('HETATM'):
+                    # AutoDock atom type is the last whitespace-delimited token on the line
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    adt_type = parts[-1]
+                    # Skip donor hydrogens
+                    if adt_type == 'HD':
+                        continue
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        current_coords.append([x, y, z])
+                        current_types.append(adt_type)
+                    except (ValueError, IndexError):
+                        continue
+    except Exception:
+        return poses
+
+    if current_coords:
+        poses.append((np.array(current_coords, dtype=np.float32), current_types))
+
     return poses
 
 
@@ -802,23 +856,89 @@ def load_protein_heavy_atom_coords(protein_pdb: Path) -> Optional[np.ndarray]:
     return np.array(coords, dtype=np.float32)
 
 
-def compute_pose_contact_features(ligand_coords: np.ndarray,
-                                   protein_tree: KDTree) -> Dict:
+def load_protein_atoms(
+    protein_pdb: Path,
+) -> Optional[Tuple[np.ndarray, List[str], List[str]]]:
+    """
+    Parse a protein PDB file and return heavy-atom coordinates, elements, and residue names.
+
+    Returns:
+        Tuple of (coords array (N,3), elements list, resnames list), or None if parsing fails
+    """
+    coords, elements, resnames = [], [], []
+    try:
+        with open(protein_pdb, 'r') as f:
+            for line in f:
+                if not (line.startswith('ATOM') or line.startswith('HETATM')):
+                    continue
+                atom_name = line[12:16].strip()
+                # Determine element: prefer element column (76-78), fall back to atom name
+                element = ''
+                if len(line) >= 78:
+                    element = line[76:78].strip().upper()
+                if not element:
+                    # Infer from atom name: strip leading digits, take first letter
+                    stripped = atom_name.lstrip('0123456789')
+                    element = stripped[0].upper() if stripped else ''
+                # Skip hydrogens
+                if element == 'H':
+                    continue
+                if not element and (atom_name.startswith('H') or
+                                    (len(atom_name) > 1 and atom_name[1] == 'H')):
+                    continue
+                resname = line[17:20].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+                    elements.append(element)
+                    resnames.append(resname)
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        print(f"    Warning: Could not parse protein PDB {protein_pdb}: {e}")
+        return None
+
+    if not coords:
+        return None
+    return np.array(coords, dtype=np.float32), elements, resnames
+
+
+_POLAR_LIG_TYPES = {'OA', 'NA', 'N', 'O'}
+_HYDROPHOBIC_LIG_TYPES = {'C', 'A'}
+
+
+def compute_pose_contact_features(
+    ligand_coords: np.ndarray,
+    protein_tree: KDTree,
+    ligand_atom_types: Optional[List[str]] = None,
+    protein_hydrophobic_tree: Optional[KDTree] = None,
+    protein_polar_tree: Optional[KDTree] = None,
+    protein_aromatic_tree: Optional[KDTree] = None,
+) -> Dict:
     """
     Compute protein–ligand contact features using a pre-built KDTree of protein atoms.
 
     Args:
         ligand_coords: (N_ligand, 3) array of ligand heavy-atom coordinates
-        protein_tree:  KDTree built from protein heavy-atom coordinates
+        protein_tree:  KDTree built from all protein heavy-atom coordinates
+        ligand_atom_types: AutoDock atom types per ligand atom (enables chemical features)
+        protein_hydrophobic_tree: KDTree of protein C/S atoms
+        protein_polar_tree: KDTree of protein N/O atoms
+        protein_aromatic_tree: KDTree of protein atoms in aromatic residues
 
     Returns:
         Dictionary of contact feature values
     """
+    all_base_keys = ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
+                     'contact_min_dist', 'contact_score_lj',
+                     'contact_buried_frac', 'contact_n_per_atom']
+    all_rich_keys = ['contact_n_hydrophobic', 'contact_n_hbond', 'contact_n_aromatic',
+                     'contact_score_gaussian', 'contact_hbond_normalized']
     n_lig = len(ligand_coords)
     if n_lig == 0:
-        return {k: np.nan for k in ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
-                                     'contact_min_dist', 'contact_score_lj',
-                                     'contact_buried_frac', 'contact_n_per_atom']}
+        return {k: np.nan for k in all_base_keys + all_rich_keys}
 
     # Count contacts at different radii
     counts_5A = protein_tree.query_ball_point(ligand_coords, r=5.0, return_length=True)
@@ -829,19 +949,18 @@ def compute_pose_contact_features(ligand_coords: np.ndarray,
     n_4A = int(counts_4A.sum())
     n_3A = int(counts_3A.sum())
 
-    # Minimum protein–ligand distance
+    # Minimum protein–ligand distance per ligand atom
     min_dists, _ = protein_tree.query(ligand_coords, k=1)
     min_dist = float(min_dists.min())
 
     # Approximate attractive LJ term: Σ (1/r^6), capped at r > 0.5 Å to avoid singularity
-    # Use nearest-neighbour distance for each ligand atom (fast approximation)
     lj_score = float(np.sum(1.0 / np.maximum(min_dists, 0.5) ** 6))
 
     # Fraction of ligand atoms "buried" (at least one protein atom within 4.5 Å)
     counts_45A = protein_tree.query_ball_point(ligand_coords, r=4.5, return_length=True)
     buried_frac = float((counts_45A > 0).sum() / n_lig)
 
-    return {
+    result = {
         'contact_n_3A': n_3A,
         'contact_n_4A': n_4A,
         'contact_n_5A': n_5A,
@@ -850,6 +969,59 @@ def compute_pose_contact_features(ligand_coords: np.ndarray,
         'contact_buried_frac': buried_frac,
         'contact_n_per_atom': n_4A / n_lig,
     }
+
+    # --- Atom-type-aware features (only when type info is available) ---
+    if ligand_atom_types is not None:
+        lig_hphob_mask = np.array([t in _HYDROPHOBIC_LIG_TYPES for t in ligand_atom_types])
+        lig_polar_mask  = np.array([t in _POLAR_LIG_TYPES       for t in ligand_atom_types])
+        n_polar_lig = int(lig_polar_mask.sum())
+
+        # Hydrophobic contacts
+        contact_n_hydrophobic = np.nan
+        if protein_hydrophobic_tree is not None and lig_hphob_mask.any():
+            hphob_counts = protein_hydrophobic_tree.query_ball_point(
+                ligand_coords[lig_hphob_mask], r=4.5, return_length=True)
+            contact_n_hydrophobic = int(hphob_counts.sum())
+
+        # H-bond contacts
+        contact_n_hbond = np.nan
+        if protein_polar_tree is not None and lig_polar_mask.any():
+            hbond_counts = protein_polar_tree.query_ball_point(
+                ligand_coords[lig_polar_mask], r=3.5, return_length=True)
+            contact_n_hbond = int(hbond_counts.sum())
+        else:
+            contact_n_hbond = 0
+
+        # Aromatic contacts
+        contact_n_aromatic = np.nan
+        if protein_aromatic_tree is not None:
+            arom_counts = protein_aromatic_tree.query_ball_point(
+                ligand_coords, r=5.0, return_length=True)
+            contact_n_aromatic = int(arom_counts.sum())
+
+        # Gaussian-weighted contact score (smooth version of shell counts)
+        contact_score_gaussian = float(np.sum(np.exp(-min_dists ** 2 / 8.0)))
+
+        # H-bonds normalised by polar ligand atom count
+        contact_hbond_normalized = (float(contact_n_hbond) / max(n_polar_lig, 1)
+                                    if not np.isnan(contact_n_hbond) else np.nan)
+
+        result.update({
+            'contact_n_hydrophobic':   contact_n_hydrophobic,
+            'contact_n_hbond':         contact_n_hbond,
+            'contact_n_aromatic':      contact_n_aromatic,
+            'contact_score_gaussian':  contact_score_gaussian,
+            'contact_hbond_normalized': contact_hbond_normalized,
+        })
+    else:
+        result.update({k: np.nan for k in all_rich_keys})
+
+    return result
+
+
+_HYDROPHOBIC_ELEMENTS = {'C', 'S'}
+_POLAR_ELEMENTS = {'N', 'O'}
+_AROMATIC_RESNAMES = {'PHE', 'TRP', 'TYR', 'HIS', 'ARG'}
 
 
 def augment_with_contact_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -868,7 +1040,9 @@ def augment_with_contact_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     contact_cols = ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
                     'contact_min_dist', 'contact_score_lj',
-                    'contact_buried_frac', 'contact_n_per_atom']
+                    'contact_buried_frac', 'contact_n_per_atom',
+                    'contact_n_hydrophobic', 'contact_n_hbond', 'contact_n_aromatic',
+                    'contact_score_gaussian', 'contact_hbond_normalized']
     new_df = df.copy()
     for col in contact_cols:
         new_df[col] = np.nan
@@ -881,26 +1055,48 @@ def augment_with_contact_features(df: pd.DataFrame) -> pd.DataFrame:
         if not protein_pdb.exists() or not pdbqt_file.exists():
             continue
 
-        protein_coords = load_protein_heavy_atom_coords(protein_pdb)
-        if protein_coords is None or len(protein_coords) == 0:
+        protein_result = load_protein_atoms(protein_pdb)
+        if protein_result is None:
+            continue
+        protein_coords, prot_elements, prot_resnames = protein_result
+        if len(protein_coords) == 0:
             continue
 
         protein_tree = KDTree(protein_coords)
 
-        pose_coords_list = extract_pose_coordinates(pdbqt_file)
-        if not pose_coords_list:
+        # Build subset KDTrees for atom-type-aware features
+        prot_elem_arr = np.array(prot_elements)
+        prot_res_arr  = np.array(prot_resnames)
+
+        hphob_mask   = np.array([e in _HYDROPHOBIC_ELEMENTS for e in prot_elements])
+        polar_mask    = np.array([e in _POLAR_ELEMENTS       for e in prot_elements])
+        aromatic_mask = np.array([r in _AROMATIC_RESNAMES    for r in prot_resnames])
+
+        protein_hydrophobic_tree = KDTree(protein_coords[hphob_mask])   if hphob_mask.any()   else None
+        protein_polar_tree       = KDTree(protein_coords[polar_mask])    if polar_mask.any()    else None
+        protein_aromatic_tree    = KDTree(protein_coords[aromatic_mask]) if aromatic_mask.any() else None
+
+        pose_atoms_list = extract_pose_atoms(pdbqt_file)
+        if not pose_atoms_list:
             continue
 
         found += 1
         complex_mask = new_df['pdb_code'] == pdb_code
         for row_idx in new_df[complex_mask].index:
             pose_idx = int(new_df.loc[row_idx, 'pose_idx'])
-            if pose_idx < len(pose_coords_list) and len(pose_coords_list[pose_idx]) > 0:
-                feats = compute_pose_contact_features(
-                    pose_coords_list[pose_idx].astype(np.float32), protein_tree
-                )
-                for col, val in feats.items():
-                    new_df.loc[row_idx, col] = val
+            if pose_idx < len(pose_atoms_list):
+                pose_coords, pose_types = pose_atoms_list[pose_idx]
+                if len(pose_coords) > 0:
+                    feats = compute_pose_contact_features(
+                        pose_coords,
+                        protein_tree,
+                        ligand_atom_types=pose_types,
+                        protein_hydrophobic_tree=protein_hydrophobic_tree,
+                        protein_polar_tree=protein_polar_tree,
+                        protein_aromatic_tree=protein_aromatic_tree,
+                    )
+                    for col, val in feats.items():
+                        new_df.loc[row_idx, col] = val
 
     print(f"  Added contact features for {found}/{df['pdb_code'].nunique()} complexes")
     return new_df
@@ -1306,6 +1502,129 @@ def optimize_affinity_hyperparams(
     return study.best_params
 
 
+def optimize_svr_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """Optuna search for SVR affinity hyperparameters (5-fold KFold on train+val)."""
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        C       = trial.suggest_categorical('C',       [0.1, 1.0, 10.0, 100.0])
+        epsilon = trial.suggest_categorical('epsilon', [0.01, 0.05, 0.1, 0.5])
+        gamma   = trial.suggest_categorical('gamma',   ['scale', 'auto', 0.01, 0.1])
+        pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('svr', SVR(kernel='rbf', C=C, epsilon=epsilon, gamma=gamma)),
+        ])
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            pipe.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], pipe.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', storage=storage,
+        study_name='svr_affinity', load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing SVR affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  SVR affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def optimize_xgb_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """Optuna search for XGBRegressor affinity hyperparameters (5-fold KFold on train+val)."""
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_categorical('n_estimators',    [100, 200, 300, 500]),
+            'max_depth':        trial.suggest_categorical('max_depth',        [3, 4, 5, 6, 7]),
+            'learning_rate':    trial.suggest_categorical('learning_rate',    [0.01, 0.05, 0.1, 0.2]),
+            'subsample':        trial.suggest_categorical('subsample',        [0.6, 0.7, 0.8, 0.9]),
+            'colsample_bytree': trial.suggest_categorical('colsample_bytree', [0.6, 0.7, 0.8, 0.9]),
+        }
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            reg = xgb.XGBRegressor(**params, random_state=RANDOM_SEED, n_jobs=-1,
+                                   verbosity=0)
+            reg.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], reg.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', storage=storage,
+        study_name='xgb_affinity', load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing XGB affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  XGB affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+def optimize_ridge_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+) -> Dict:
+    """Optuna search for Ridge affinity alpha (5-fold KFold on train+val)."""
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        alpha = trial.suggest_categorical('alpha', [0.001, 0.01, 0.1, 1.0, 10.0, 100.0])
+        pipe = Pipeline([('scaler', StandardScaler()), ('ridge', Ridge(alpha=alpha))])
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            pipe.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], pipe.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', storage=storage,
+        study_name='ridge_affinity', load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing Ridge affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  Ridge affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
 def train_rf_ranker(
     train_df: pd.DataFrame,
     hyperparams: Optional[Dict] = None
@@ -1696,21 +2015,24 @@ def prepare_affinity_data(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataF
 def train_affinity_model(
     train_affinity_df: pd.DataFrame,
     feature_cols: List[str],
-    hyperparams_gb: Optional[Dict] = None
+    hyperparams_gb: Optional[Dict] = None,
+    hyperparams_svr: Optional[Dict] = None,
+    hyperparams_xgb: Optional[Dict] = None,
+    hyperparams_ridge: Optional[Dict] = None,
 ) -> Dict:
     """
-    Train RF and GB regressors to predict experimental binding affinity (ΔG, kcal/mol).
+    Train RF, GB, SVR, XGBoost, and Ridge regressors to predict binding affinity (ΔG, kcal/mol).
 
     Args:
         train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
         feature_cols:      Feature column names.
-        hyperparams_gb:    Optional dict of GB hyperparameters to override defaults
-                           (e.g. from optimize_affinity_hyperparams()).
+        hyperparams_gb:    Optional GB hyperparameters (from optimize_affinity_hyperparams).
+        hyperparams_svr:   Optional SVR hyperparameters (C, epsilon, gamma).
+        hyperparams_xgb:   Optional XGBRegressor hyperparameters.
+        hyperparams_ridge: Optional Ridge hyperparameters (alpha).
 
     Returns:
-        Dict mapping model name → (fitted model, feature_cols used):
-            'rf_affinity':  (RandomForestRegressor, cols)
-            'gb_affinity':  (GradientBoostingRegressor, cols)
+        Dict mapping model name → (fitted model, feature_cols used).
     """
     available_cols = [c for c in feature_cols if c in train_affinity_df.columns]
     X = train_affinity_df[available_cols].values
@@ -1728,11 +2050,34 @@ def train_affinity_model(
     gb = GradientBoostingRegressor(**gb_params, random_state=RANDOM_SEED)
     gb.fit(X, y)
 
+    svr_params = {'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale', **(hyperparams_svr or {})}
+    svr_pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('svr', SVR(kernel='rbf', **svr_params)),
+    ])
+    svr_pipe.fit(X, y)
+
+    xgb_params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
+                  'subsample': 0.8, 'colsample_bytree': 0.8, **(hyperparams_xgb or {})}
+    xgb_reg = xgb.XGBRegressor(**xgb_params, random_state=RANDOM_SEED, n_jobs=-1,
+                                verbosity=0)
+    xgb_reg.fit(X, y)
+
+    ridge_alpha = (hyperparams_ridge or {}).get('alpha', 1.0)
+    ridge_pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('ridge', Ridge(alpha=ridge_alpha)),
+    ])
+    ridge_pipe.fit(X, y)
+
     print(f"  Trained affinity models on {len(train_affinity_df)} complexes, "
           f"{len(available_cols)} features")
     return {
-        'rf_affinity': (rf, available_cols),
-        'gb_affinity': (gb, available_cols),
+        'rf_affinity':    (rf,         available_cols),
+        'gb_affinity':    (gb,         available_cols),
+        'svr_affinity':   (svr_pipe,   available_cols),
+        'xgb_affinity':  (xgb_reg,    available_cols),
+        'ridge_affinity': (ridge_pipe, available_cols),
     }
 
 
@@ -1792,55 +2137,72 @@ def plot_affinity_predictions(
     split: str = 'test',
 ) -> None:
     """
-    Side-by-side scatter: Vina score vs exp ΔG (left), best ML model vs exp ΔG (right).
+    Grid of scatter plots showing ALL affinity models vs exp ΔG.
+    Order: Vina baseline first, then ML models sorted by Pearson r descending.
     Points coloured by rank-1 pose RMSD (0–10 Å, RdYlGn_r colourmap).
-    Both subplots share the same x/y axis limits for direct comparison.
+    All subplots share the same x/y axis limits for direct comparison.
 
     Args:
         affinity_metrics: Dict from evaluate_affinity_model().
         output_dir:       Directory to save the plot.
         split:            'test' or 'val' — controls filename and figure title.
     """
-    ml_names = [k for k in affinity_metrics if k != 'vina_baseline']
-    best_ml_name = max(ml_names, key=lambda k: affinity_metrics[k]['pearson_r'])
+    ml_names = sorted(
+        [k for k in affinity_metrics if k != 'vina_baseline'],
+        key=lambda k: affinity_metrics[k]['pearson_r'],
+        reverse=True,
+    )
+    ordered = ['vina_baseline'] + ml_names
 
-    # Compute shared axis limits across both models
+    # Shared axis limits across ALL models
     all_vals = []
-    for name in ['vina_baseline', best_ml_name]:
+    for name in ordered:
         m = affinity_metrics[name]
         all_vals.extend([m['y_true'], m['y_pred']])
     shared_lims = [min(v.min() for v in all_vals) - 0.5,
                    max(v.max() for v in all_vals) + 0.5]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f'Binding Affinity Predictions ({split.capitalize()} set)', fontsize=13)
-    sc = None
-    for ax, name in zip(axes, ['vina_baseline', best_ml_name]):
+    n_models = len(ordered)
+    n_cols = min(n_models, 3)
+    n_rows = math.ceil(n_models / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 6 * n_rows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+    fig.suptitle(f'Binding Affinity Predictions ({split.capitalize()} set)', fontsize=14)
+
+    last_sc = None
+    for i, name in enumerate(ordered):
+        ax = axes_flat[i]
         m = affinity_metrics[name]
-        y_true = m['y_true']
-        y_pred = m['y_pred']
         rmsd_colors = np.clip(m['rmsd_rank1'], 0, 10)
 
-        sc = ax.scatter(y_true, y_pred, c=rmsd_colors, cmap='RdYlGn_r',
+        sc = ax.scatter(m['y_true'], m['y_pred'], c=rmsd_colors, cmap='RdYlGn_r',
                         vmin=0, vmax=10, alpha=0.6, s=20, edgecolors='none')
+        last_sc = sc
 
         ax.plot(shared_lims, shared_lims, 'k--', lw=1, alpha=0.5)
         ax.set_xlim(shared_lims)
         ax.set_ylim(shared_lims)
 
         label = 'Vina score' if name == 'vina_baseline' else name
-        ax.set_xlabel('Experimental ΔG (kcal/mol)', fontsize=12)
-        ax.set_ylabel(f'Predicted — {label} (kcal/mol)', fontsize=12)
+        ax.set_xlabel('Experimental ΔG (kcal/mol)', fontsize=11)
+        ax.set_ylabel(f'Predicted — {label} (kcal/mol)', fontsize=11)
         ax.set_title(
             f'{label}\nPearson r={m["pearson_r"]:.3f}  '
             f'Spearman r={m["spearman_r"]:.3f}  '
             f'RMSE={m["rmse"]:.2f} kcal/mol',
-            fontsize=11
+            fontsize=10,
         )
         ax.grid(True, alpha=0.3)
 
-    if sc is not None:
-        plt.colorbar(sc, ax=axes[1], label='Rank-1 pose RMSD (Å)')
+    # Hide unused subplots
+    for j in range(n_models, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    # Colorbar on last used axis
+    if last_sc is not None:
+        fig.colorbar(last_sc, ax=axes_flat[n_models - 1], label='Rank-1 pose RMSD (Å)')
+
     plt.tight_layout()
     out_path = output_dir / f'affinity_predictions_{split}.png'
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
@@ -2619,26 +2981,38 @@ def main():
     rf_hyperparams      = None
     gb_hyperparams      = None
     xgb_hyperparams     = None
-    gb_affinity_preload = None
+    gb_affinity_preload    = None
+    svr_affinity_preload   = None
+    xgb_affinity_preload   = None
+    ridge_affinity_preload = None
     if args.load_hyperparams:
         hp_path = Path(args.load_hyperparams)
         if not hp_path.exists():
             print(f"Warning: --load-hyperparams file not found: {hp_path}. Using defaults.")
         else:
             loaded_hp = json.loads(hp_path.read_text())
-            rf_hyperparams      = loaded_hp.get('rf_ranker', {}) or None
-            gb_hyperparams      = loaded_hp.get('gb_ranker', {}) or None
-            xgb_hyperparams     = loaded_hp.get('xgb_ranker', {}) or None
-            gb_affinity_preload = loaded_hp.get('gb_affinity', {}) or None
+            rf_hyperparams         = loaded_hp.get('rf_ranker',      {}) or None
+            gb_hyperparams         = loaded_hp.get('gb_ranker',      {}) or None
+            xgb_hyperparams        = loaded_hp.get('xgb_ranker',     {}) or None
+            gb_affinity_preload    = loaded_hp.get('gb_affinity',    {}) or None
+            svr_affinity_preload   = loaded_hp.get('svr_affinity',   {}) or None
+            xgb_affinity_preload   = loaded_hp.get('xgb_affinity',   {}) or None
+            ridge_affinity_preload = loaded_hp.get('ridge_affinity', {}) or None
             print(f"Loaded hyperparameters from {hp_path}")
             if rf_hyperparams:
-                print(f"  RF ranker  : {rf_hyperparams}")
+                print(f"  RF ranker       : {rf_hyperparams}")
             if gb_hyperparams:
-                print(f"  GB ranker  : {gb_hyperparams}")
+                print(f"  GB ranker       : {gb_hyperparams}")
             if xgb_hyperparams:
-                print(f"  XGB ranker : {xgb_hyperparams}")
+                print(f"  XGB ranker      : {xgb_hyperparams}")
             if gb_affinity_preload:
-                print(f"  GB affinity: {gb_affinity_preload}")
+                print(f"  GB affinity     : {gb_affinity_preload}")
+            if svr_affinity_preload:
+                print(f"  SVR affinity    : {svr_affinity_preload}")
+            if xgb_affinity_preload:
+                print(f"  XGB affinity    : {xgb_affinity_preload}")
+            if ridge_affinity_preload:
+                print(f"  Ridge affinity  : {ridge_affinity_preload}")
 
     # --- Optional: Optuna hyperparameter search for RF ranker ---
     # (overwrites loaded params if --optimize-hyperparams is also set)
@@ -2837,7 +3211,10 @@ def main():
         if len(train_aff) < 10 or len(test_aff) < 2:
             print("  Warning: Too few complexes with affinity labels. Skipping affinity models.")
         else:
-            gb_affinity_hyperparams = gb_affinity_preload  # None unless --load-hyperparams
+            gb_affinity_hyperparams    = gb_affinity_preload    # None unless --load-hyperparams
+            svr_affinity_hyperparams   = svr_affinity_preload
+            xgb_affinity_hyperparams   = xgb_affinity_preload
+            ridge_affinity_hyperparams = ridge_affinity_preload
             if args.optimize_hyperparams:
                 print(f"Optimising GB affinity hyperparameters "
                       f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
@@ -2846,9 +3223,34 @@ def main():
                 )
                 print(f"  Best GB affinity params: {gb_affinity_hyperparams}")
 
+                print(f"\nOptimising SVR affinity hyperparameters "
+                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                svr_affinity_hyperparams = optimize_svr_affinity_hyperparams(
+                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                )
+                print(f"  Best SVR affinity params: {svr_affinity_hyperparams}")
+
+                print(f"\nOptimising XGB affinity hyperparameters "
+                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                xgb_affinity_hyperparams = optimize_xgb_affinity_hyperparams(
+                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                )
+                print(f"  Best XGB affinity params: {xgb_affinity_hyperparams}")
+
+                print(f"\nOptimising Ridge affinity hyperparameters "
+                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                ridge_affinity_hyperparams = optimize_ridge_affinity_hyperparams(
+                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                )
+                print(f"  Best Ridge affinity params: {ridge_affinity_hyperparams}")
+
             print("Training affinity models...")
             affinity_models = train_affinity_model(
-                train_aff, feature_cols_aff, hyperparams_gb=gb_affinity_hyperparams
+                train_aff, feature_cols_aff,
+                hyperparams_gb=gb_affinity_hyperparams,
+                hyperparams_svr=svr_affinity_hyperparams,
+                hyperparams_xgb=xgb_affinity_hyperparams,
+                hyperparams_ridge=ridge_affinity_hyperparams,
             )
 
             print("Evaluating affinity models (test)...")
@@ -2883,10 +3285,13 @@ def main():
             # Save best hyperparameters if optimisation was run
             if args.optimize_hyperparams:
                 best_hp = {
-                    'rf_ranker':   rf_hyperparams or {},
-                    'gb_ranker':   gb_hyperparams or {},
-                    'xgb_ranker':  xgb_hyperparams or {},
-                    'gb_affinity': gb_affinity_hyperparams or {},
+                    'rf_ranker':      rf_hyperparams             or {},
+                    'gb_ranker':      gb_hyperparams             or {},
+                    'xgb_ranker':     xgb_hyperparams            or {},
+                    'gb_affinity':    gb_affinity_hyperparams    or {},
+                    'svr_affinity':   svr_affinity_hyperparams   or {},
+                    'xgb_affinity':   xgb_affinity_hyperparams   or {},
+                    'ridge_affinity': ridge_affinity_hyperparams or {},
                 }
                 hp_path = OUTPUT_DIR / 'best_hyperparams.json'
                 hp_path.write_text(json.dumps(best_hp, indent=2))

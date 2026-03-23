@@ -24,6 +24,7 @@ from rdkit.Chem import Descriptors, AllChem
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import Ridge
+from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
@@ -814,6 +815,57 @@ def augment_with_mol2_features(df: pd.DataFrame) -> pd.DataFrame:
     return new_df
 
 
+def compute_morgan_fingerprint(mol2_path: Path, n_bits: int = 2048) -> Optional[np.ndarray]:
+    """
+    Compute Morgan ECFP4 fingerprint (radius=2) from a mol2 file.
+
+    Returns:
+        np.ndarray of shape (n_bits,) with dtype float32, or None if parsing fails.
+    """
+    mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)
+    if mol is None:
+        return None
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
+    return np.array(fp, dtype=np.float32)
+
+
+def augment_affinity_with_fingerprints(
+    aff_df: pd.DataFrame,
+    n_bits: int = 2048,
+) -> pd.DataFrame:
+    """
+    Add Morgan ECFP4 fingerprint columns to a per-complex affinity DataFrame.
+
+    Adds n_bits columns named morgan_fp_0 … morgan_fp_{n_bits-1}.
+    Rows where the mol2 file is missing or unparseable are left as NaN.
+    Does NOT modify the main per-pose DataFrames.
+
+    Args:
+        aff_df:  Per-complex DataFrame (one row per complex) from prepare_affinity_data().
+        n_bits:  Fingerprint length in bits (default 2048).
+
+    Returns:
+        Copy of aff_df with n_bits additional columns.
+    """
+    fp_cols = [f'morgan_fp_{i}' for i in range(n_bits)]
+    new_df = aff_df.copy()
+    # Pre-allocate as float (NaN-compatible)
+    fp_matrix = np.full((len(new_df), n_bits), np.nan, dtype=np.float32)
+
+    found = 0
+    for i, row in enumerate(new_df.itertuples(index=False)):
+        mol2 = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
+        fp = compute_morgan_fingerprint(mol2, n_bits)
+        if fp is not None:
+            fp_matrix[i] = fp
+            found += 1
+
+    fp_df = pd.DataFrame(fp_matrix, columns=fp_cols, index=new_df.index)
+    new_df = pd.concat([new_df, fp_df], axis=1)
+    print(f"  Morgan fingerprints: {found}/{len(new_df)} complexes")
+    return new_df
+
+
 def load_protein_heavy_atom_coords(protein_pdb: Path) -> Optional[np.ndarray]:
     """
     Parse a protein PDB file and return heavy-atom (non-hydrogen) XYZ coordinates.
@@ -1440,12 +1492,56 @@ def optimize_xgb_ranker_hyperparams(
     return study.best_params
 
 
+def optimize_rf_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+    study_name: str = 'rf_affinity',
+) -> Dict:
+    """Optuna search for RF affinity hyperparameters (5-fold KFold on train+val)."""
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        params = {
+            'n_estimators':    trial.suggest_categorical('n_estimators',    [100, 200, 300, 500]),
+            'max_depth':       trial.suggest_categorical('max_depth',       [5, 8, 10, 15, None]),
+            'max_features':    trial.suggest_categorical('max_features',    ['sqrt', 'log2', 0.3, 0.5]),
+            'min_samples_leaf':trial.suggest_categorical('min_samples_leaf',[1, 2, 5, 10]),
+        }
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            rf = RandomForestRegressor(**params, random_state=RANDOM_SEED, n_jobs=-1)
+            rf.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], rf.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', storage=storage,
+        study_name=study_name, load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing RF affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  RF affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
 def optimize_affinity_hyperparams(
     train_affinity_df: pd.DataFrame,
     val_affinity_df: pd.DataFrame,
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
+    study_name: str = 'gb_affinity',
 ) -> Dict:
     """
     Use Optuna to find optimal GB affinity hyperparameters via 5-fold KFold CV.
@@ -1490,14 +1586,14 @@ def optimize_affinity_hyperparams(
     study = optuna.create_study(
         direction='maximize',
         storage=storage,
-        study_name='gb_affinity',
+        study_name=study_name,
         load_if_exists=True,
     )
     n_existing = len(study.trials)
     if n_existing:
-        print(f"  Loaded {n_existing} existing GB affinity trials from storage")
+        print(f"  Loaded {n_existing} existing {study_name} trials from storage")
     study.optimize(objective, n_trials=n_trials)
-    print(f"  GB affinity best CV score: {study.best_value:.6f} "
+    print(f"  {study_name} best CV score: {study.best_value:.6f} "
           f"(over {len(study.trials)} total trials)")
     return study.best_params
 
@@ -1508,6 +1604,7 @@ def optimize_svr_affinity_hyperparams(
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
+    study_name: str = 'svr_affinity',
 ) -> Dict:
     """Optuna search for SVR affinity hyperparameters (5-fold KFold on train+val)."""
     cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
@@ -1533,7 +1630,7 @@ def optimize_svr_affinity_hyperparams(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='maximize', storage=storage,
-        study_name='svr_affinity', load_if_exists=True,
+        study_name=study_name, load_if_exists=True,
     )
     n_existing = len(study.trials)
     if n_existing:
@@ -1550,6 +1647,7 @@ def optimize_xgb_affinity_hyperparams(
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
+    study_name: str = 'xgb_affinity',
 ) -> Dict:
     """Optuna search for XGBRegressor affinity hyperparameters (5-fold KFold on train+val)."""
     cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
@@ -1577,7 +1675,7 @@ def optimize_xgb_affinity_hyperparams(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='maximize', storage=storage,
-        study_name='xgb_affinity', load_if_exists=True,
+        study_name=study_name, load_if_exists=True,
     )
     n_existing = len(study.trials)
     if n_existing:
@@ -1594,6 +1692,7 @@ def optimize_ridge_affinity_hyperparams(
     feature_cols: List[str],
     n_trials: int = 30,
     storage: Optional[str] = None,
+    study_name: str = 'ridge_affinity',
 ) -> Dict:
     """Optuna search for Ridge affinity alpha (5-fold KFold on train+val)."""
     cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
@@ -1614,13 +1713,68 @@ def optimize_ridge_affinity_hyperparams(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='maximize', storage=storage,
-        study_name='ridge_affinity', load_if_exists=True,
+        study_name=study_name, load_if_exists=True,
     )
     n_existing = len(study.trials)
     if n_existing:
         print(f"  Loaded {n_existing} existing Ridge affinity trials from storage")
     study.optimize(objective, n_trials=n_trials)
     print(f"  Ridge affinity best CV score: {study.best_value:.6f} "
+          f"(over {len(study.trials)} total trials)")
+    return study.best_params
+
+
+_MLP_LAYER_SIZES = [(64,), (128,), (256,), (128, 64), (256, 128), (256, 128, 64)]
+
+
+def optimize_mlp_affinity_hyperparams(
+    train_affinity_df: pd.DataFrame,
+    val_affinity_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_trials: int = 30,
+    storage: Optional[str] = None,
+    study_name: str = 'mlp_affinity',
+) -> Dict:
+    """Optuna search for MLP affinity hyperparameters (5-fold KFold on train+val).
+
+    hidden_layer_sizes is stored as an integer index into _MLP_LAYER_SIZES
+    (tuples are not JSON-serializable).
+    """
+    cv_df = pd.concat([train_affinity_df, val_affinity_df], ignore_index=True)
+    available_cols = [c for c in feature_cols if c in cv_df.columns]
+    X = np.nan_to_num(cv_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+    y = cv_df['exp_affinity_kcal_mol'].values
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+
+    def objective(trial):
+        layer_idx = trial.suggest_categorical('hidden_layer_sizes', list(range(len(_MLP_LAYER_SIZES))))
+        alpha = trial.suggest_categorical('alpha', [1e-4, 1e-3, 0.01, 0.1])
+        lr_init = trial.suggest_categorical('learning_rate_init', [1e-4, 1e-3, 0.01])
+        pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('mlp', MLPRegressor(
+                hidden_layer_sizes=_MLP_LAYER_SIZES[layer_idx],
+                alpha=alpha,
+                learning_rate_init=lr_init,
+                max_iter=500, early_stopping=True, random_state=RANDOM_SEED,
+            )),
+        ])
+        scores = []
+        for train_idx, val_idx in kf.split(X):
+            pipe.fit(X[train_idx], y[train_idx])
+            scores.append(-mean_squared_error(y[val_idx], pipe.predict(X[val_idx])))
+        return float(np.mean(scores))
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction='maximize', storage=storage,
+        study_name=study_name, load_if_exists=True,
+    )
+    n_existing = len(study.trials)
+    if n_existing:
+        print(f"  Loaded {n_existing} existing MLP affinity trials from storage")
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  MLP affinity best CV score: {study.best_value:.6f} "
           f"(over {len(study.trials)} total trials)")
     return study.best_params
 
@@ -2015,21 +2169,25 @@ def prepare_affinity_data(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataF
 def train_affinity_model(
     train_affinity_df: pd.DataFrame,
     feature_cols: List[str],
+    hyperparams_rf: Optional[Dict] = None,
     hyperparams_gb: Optional[Dict] = None,
     hyperparams_svr: Optional[Dict] = None,
     hyperparams_xgb: Optional[Dict] = None,
     hyperparams_ridge: Optional[Dict] = None,
+    hyperparams_mlp: Optional[Dict] = None,
 ) -> Dict:
     """
-    Train RF, GB, SVR, XGBoost, and Ridge regressors to predict binding affinity (ΔG, kcal/mol).
+    Train RF, GB, SVR, XGBoost, Ridge, and MLP regressors to predict binding affinity (ΔG, kcal/mol).
 
     Args:
         train_affinity_df: Per-complex training DataFrame from prepare_affinity_data().
         feature_cols:      Feature column names.
+        hyperparams_rf:    Optional RF hyperparameters (from optimize_rf_affinity_hyperparams).
         hyperparams_gb:    Optional GB hyperparameters (from optimize_affinity_hyperparams).
         hyperparams_svr:   Optional SVR hyperparameters (C, epsilon, gamma).
         hyperparams_xgb:   Optional XGBRegressor hyperparameters.
         hyperparams_ridge: Optional Ridge hyperparameters (alpha).
+        hyperparams_mlp:   Optional MLP hyperparameters (hidden_layer_sizes index, alpha, lr).
 
     Returns:
         Dict mapping model name → (fitted model, feature_cols used).
@@ -2039,10 +2197,9 @@ def train_affinity_model(
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y = train_affinity_df['exp_affinity_kcal_mol'].values
 
-    rf = RandomForestRegressor(
-        n_estimators=300, max_depth=10, min_samples_leaf=5,
-        random_state=RANDOM_SEED, n_jobs=-1
-    )
+    rf_params = {'n_estimators': 300, 'max_depth': 10, 'min_samples_leaf': 5,
+                 **(hyperparams_rf or {})}
+    rf = RandomForestRegressor(**rf_params, random_state=RANDOM_SEED, n_jobs=-1)
     rf.fit(X, y)
 
     gb_params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
@@ -2070,6 +2227,19 @@ def train_affinity_model(
     ])
     ridge_pipe.fit(X, y)
 
+    mlp_p = hyperparams_mlp or {}
+    layer_idx = mlp_p.get('hidden_layer_sizes', 4)   # default index 4 → (256, 128)
+    mlp_pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('mlp', MLPRegressor(
+            hidden_layer_sizes=_MLP_LAYER_SIZES[layer_idx],
+            alpha=mlp_p.get('alpha', 1e-3),
+            learning_rate_init=mlp_p.get('learning_rate_init', 1e-3),
+            max_iter=500, early_stopping=True, random_state=RANDOM_SEED,
+        )),
+    ])
+    mlp_pipe.fit(X, y)
+
     print(f"  Trained affinity models on {len(train_affinity_df)} complexes, "
           f"{len(available_cols)} features")
     return {
@@ -2078,6 +2248,7 @@ def train_affinity_model(
         'svr_affinity':   (svr_pipe,   available_cols),
         'xgb_affinity':  (xgb_reg,    available_cols),
         'ridge_affinity': (ridge_pipe, available_cols),
+        'mlp_affinity':   (mlp_pipe,   available_cols),
     }
 
 
@@ -2129,6 +2300,51 @@ def evaluate_affinity_model(
         }
 
     return results
+
+
+def print_affinity_comparison_table(
+    metrics_a: Dict,
+    metrics_b: Dict,
+    label_a: str = 'Current Features',
+    label_b: str = 'Fingerprints Only',
+    split: str = 'test',
+) -> None:
+    """
+    Print a formatted side-by-side comparison of affinity metrics for two feature sets.
+
+    Args:
+        metrics_a: Output of evaluate_affinity_model() for feature set A.
+        metrics_b: Output of evaluate_affinity_model() for feature set B.
+        label_a:   Display name for feature set A.
+        label_b:   Display name for feature set B.
+        split:     Label for the data split (e.g. 'test' or 'val').
+    """
+    all_models = sorted(
+        set(metrics_a.keys()) | set(metrics_b.keys()),
+        key=lambda k: (k == 'vina_baseline', k),
+    )
+
+    hdr_a = f'── {label_a} ──'
+    hdr_b = f'── {label_b} ──'
+    col_w = max(len(hdr_a), len(hdr_b), 24)
+
+    print(f"\nAffinity comparison ({split} set):")
+    print(f"{'Model':<22}  {hdr_a:>{col_w}}  {hdr_b:>{col_w}}")
+    print(f"{'':22}  {'Pearson r':>10} {'Spearman':>10} {'RMSE':>7}  "
+          f"{'Pearson r':>10} {'Spearman':>10} {'RMSE':>7}")
+    print('-' * (22 + 2 + col_w*2 + 10))
+
+    for name in all_models:
+        ma = metrics_a.get(name, {})
+        mb = metrics_b.get(name, {})
+        pr_a  = f"{ma.get('pearson_r',  float('nan')):+.3f}" if ma else '   n/a'
+        sp_a  = f"{ma.get('spearman_r', float('nan')):+.3f}" if ma else '   n/a'
+        rm_a  = f"{ma.get('rmse',       float('nan')):.3f}"  if ma else '  n/a'
+        pr_b  = f"{mb.get('pearson_r',  float('nan')):+.3f}" if mb else '   n/a'
+        sp_b  = f"{mb.get('spearman_r', float('nan')):+.3f}" if mb else '   n/a'
+        rm_b  = f"{mb.get('rmse',       float('nan')):.3f}"  if mb else '  n/a'
+        print(f"  {name:<20}  {pr_a:>10} {sp_a:>10} {rm_a:>7}  "
+              f"{pr_b:>10} {sp_b:>10} {rm_b:>7}")
 
 
 def plot_affinity_predictions(
@@ -2887,6 +3103,40 @@ def main():
              'without running Optuna (e.g. output/best_hyperparams.json). '
              'If --optimize-hyperparams is also set, Optuna runs and overwrites these.'
     )
+    parser.add_argument(
+        '--load-hyperparams-fp',
+        type=str,
+        default=None,
+        metavar='JSON_PATH',
+        help='Load previously optimised hyperparameters for fingerprint-only affinity models '
+             '(e.g. output/best_hyperparams_fp.json). Used with --affinity-compare-features.'
+    )
+    parser.add_argument(
+        '--affinity-compare-features',
+        action='store_true',
+        help='Compare affinity models trained on current features vs Morgan fingerprints only. '
+             'Generates separate plots and a side-by-side summary table.'
+    )
+    _ALL_OPT_MODELS = [
+        'rf_ranker', 'gb_ranker', 'xgb_ranker',
+        'rf_affinity', 'gb_affinity', 'svr_affinity', 'xgb_affinity', 'ridge_affinity', 'mlp_affinity',
+        'rf_affinity_fp', 'gb_affinity_fp', 'svr_affinity_fp', 'xgb_affinity_fp',
+        'ridge_affinity_fp', 'mlp_affinity_fp',
+    ]
+    parser.add_argument(
+        '--optimize-models',
+        nargs='+',
+        choices=_ALL_OPT_MODELS,
+        metavar='MODEL',
+        default=None,
+        help=(
+            'Restrict hyperparameter optimisation to specific models '
+            '(requires --optimize-hyperparams). '
+            f'Choices: {", ".join(_ALL_OPT_MODELS)}. '
+            'Default: all models. '
+            'Example: --optimize-models mlp_affinity gb_affinity_fp mlp_affinity_fp'
+        )
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -2981,10 +3231,12 @@ def main():
     rf_hyperparams      = None
     gb_hyperparams      = None
     xgb_hyperparams     = None
+    rf_affinity_preload    = None
     gb_affinity_preload    = None
     svr_affinity_preload   = None
     xgb_affinity_preload   = None
     ridge_affinity_preload = None
+    mlp_affinity_preload   = None
     if args.load_hyperparams:
         hp_path = Path(args.load_hyperparams)
         if not hp_path.exists():
@@ -2994,10 +3246,12 @@ def main():
             rf_hyperparams         = loaded_hp.get('rf_ranker',      {}) or None
             gb_hyperparams         = loaded_hp.get('gb_ranker',      {}) or None
             xgb_hyperparams        = loaded_hp.get('xgb_ranker',     {}) or None
+            rf_affinity_preload    = loaded_hp.get('rf_affinity',    {}) or None
             gb_affinity_preload    = loaded_hp.get('gb_affinity',    {}) or None
             svr_affinity_preload   = loaded_hp.get('svr_affinity',   {}) or None
             xgb_affinity_preload   = loaded_hp.get('xgb_affinity',   {}) or None
             ridge_affinity_preload = loaded_hp.get('ridge_affinity', {}) or None
+            mlp_affinity_preload   = loaded_hp.get('mlp_affinity',   {}) or None
             print(f"Loaded hyperparameters from {hp_path}")
             if rf_hyperparams:
                 print(f"  RF ranker       : {rf_hyperparams}")
@@ -3005,6 +3259,8 @@ def main():
                 print(f"  GB ranker       : {gb_hyperparams}")
             if xgb_hyperparams:
                 print(f"  XGB ranker      : {xgb_hyperparams}")
+            if rf_affinity_preload:
+                print(f"  RF affinity     : {rf_affinity_preload}")
             if gb_affinity_preload:
                 print(f"  GB affinity     : {gb_affinity_preload}")
             if svr_affinity_preload:
@@ -3013,32 +3269,60 @@ def main():
                 print(f"  XGB affinity    : {xgb_affinity_preload}")
             if ridge_affinity_preload:
                 print(f"  Ridge affinity  : {ridge_affinity_preload}")
+            if mlp_affinity_preload:
+                print(f"  MLP affinity    : {mlp_affinity_preload}")
 
-    # --- Optional: Optuna hyperparameter search for RF ranker ---
-    # (overwrites loaded params if --optimize-hyperparams is also set)
+    # --- Load fingerprint hyperparameters if requested ---
+    rf_affinity_hp_fp    = None
+    gb_affinity_hp_fp    = None
+    svr_affinity_hp_fp   = None
+    xgb_affinity_hp_fp   = None
+    ridge_affinity_hp_fp = None
+    mlp_affinity_hp_fp   = None
+    if args.load_hyperparams_fp:
+        hp_fp_path = Path(args.load_hyperparams_fp)
+        if not hp_fp_path.exists():
+            print(f"Warning: --load-hyperparams-fp file not found: {hp_fp_path}. Using defaults.")
+        else:
+            loaded_hp_fp = json.loads(hp_fp_path.read_text())
+            rf_affinity_hp_fp    = loaded_hp_fp.get('rf_affinity',    {}) or None
+            gb_affinity_hp_fp    = loaded_hp_fp.get('gb_affinity',    {}) or None
+            svr_affinity_hp_fp   = loaded_hp_fp.get('svr_affinity',   {}) or None
+            xgb_affinity_hp_fp   = loaded_hp_fp.get('xgb_affinity',   {}) or None
+            ridge_affinity_hp_fp = loaded_hp_fp.get('ridge_affinity', {}) or None
+            mlp_affinity_hp_fp   = loaded_hp_fp.get('mlp_affinity',   {}) or None
+            print(f"Loaded fingerprint hyperparameters from {hp_fp_path}")
+
+    # --- Optional: Optuna hyperparameter search ---
+    # models_to_opt: set of model keys to optimise; None means all
+    models_to_opt = set(args.optimize_models) if args.optimize_models else set(_ALL_OPT_MODELS)
+
     if args.optimize_hyperparams:
         feature_cols_for_opt = [c for c in train_df.columns
                                 if c not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd']]
-        print(f"\nOptimising RF ranker hyperparameters "
-              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
-        rf_hyperparams = optimize_ranker_hyperparams(
-            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
-        )
-        print(f"  Best RF params: {rf_hyperparams}")
+        if 'rf_ranker' in models_to_opt:
+            print(f"\nOptimising RF ranker hyperparameters "
+                  f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
+            rf_hyperparams = optimize_ranker_hyperparams(
+                train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+            )
+            print(f"  Best RF params: {rf_hyperparams}")
 
-        print(f"\nOptimising GB ranker hyperparameters "
-              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
-        gb_hyperparams = optimize_gb_ranker_hyperparams(
-            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
-        )
-        print(f"  Best GB params: {gb_hyperparams}")
+        if 'gb_ranker' in models_to_opt:
+            print(f"\nOptimising GB ranker hyperparameters "
+                  f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
+            gb_hyperparams = optimize_gb_ranker_hyperparams(
+                train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+            )
+            print(f"  Best GB params: {gb_hyperparams}")
 
-        print(f"\nOptimising XGB ranker hyperparameters "
-              f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
-        xgb_hyperparams = optimize_xgb_ranker_hyperparams(
-            train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
-        )
-        print(f"  Best XGB params: {xgb_hyperparams}")
+        if 'xgb_ranker' in models_to_opt:
+            print(f"\nOptimising XGB ranker hyperparameters "
+                  f"(Optuna, {args.n_trials} trials × 5-fold GroupKFold on train+val)...")
+            xgb_hyperparams = optimize_xgb_ranker_hyperparams(
+                train_df, val_df, feature_cols_for_opt, args.n_trials, storage=optuna_storage
+            )
+            print(f"  Best XGB params: {xgb_hyperparams}")
 
     # --- Train all ranker models ---
     trained = {}
@@ -3211,46 +3495,70 @@ def main():
         if len(train_aff) < 10 or len(test_aff) < 2:
             print("  Warning: Too few complexes with affinity labels. Skipping affinity models.")
         else:
-            gb_affinity_hyperparams    = gb_affinity_preload    # None unless --load-hyperparams
+            rf_affinity_hyperparams    = rf_affinity_preload    # None unless --load-hyperparams
+            gb_affinity_hyperparams    = gb_affinity_preload
             svr_affinity_hyperparams   = svr_affinity_preload
             xgb_affinity_hyperparams   = xgb_affinity_preload
             ridge_affinity_hyperparams = ridge_affinity_preload
+            mlp_affinity_hyperparams   = mlp_affinity_preload
             if args.optimize_hyperparams:
-                print(f"Optimising GB affinity hyperparameters "
-                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
-                gb_affinity_hyperparams = optimize_affinity_hyperparams(
-                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
-                )
-                print(f"  Best GB affinity params: {gb_affinity_hyperparams}")
+                if 'rf_affinity' in models_to_opt:
+                    print(f"Optimising RF affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    rf_affinity_hyperparams = optimize_rf_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best RF affinity params: {rf_affinity_hyperparams}")
 
-                print(f"\nOptimising SVR affinity hyperparameters "
-                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
-                svr_affinity_hyperparams = optimize_svr_affinity_hyperparams(
-                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
-                )
-                print(f"  Best SVR affinity params: {svr_affinity_hyperparams}")
+                if 'gb_affinity' in models_to_opt:
+                    print(f"Optimising GB affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    gb_affinity_hyperparams = optimize_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best GB affinity params: {gb_affinity_hyperparams}")
 
-                print(f"\nOptimising XGB affinity hyperparameters "
-                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
-                xgb_affinity_hyperparams = optimize_xgb_affinity_hyperparams(
-                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
-                )
-                print(f"  Best XGB affinity params: {xgb_affinity_hyperparams}")
+                if 'svr_affinity' in models_to_opt:
+                    print(f"\nOptimising SVR affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    svr_affinity_hyperparams = optimize_svr_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best SVR affinity params: {svr_affinity_hyperparams}")
 
-                print(f"\nOptimising Ridge affinity hyperparameters "
-                      f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
-                ridge_affinity_hyperparams = optimize_ridge_affinity_hyperparams(
-                    train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
-                )
-                print(f"  Best Ridge affinity params: {ridge_affinity_hyperparams}")
+                if 'xgb_affinity' in models_to_opt:
+                    print(f"\nOptimising XGB affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    xgb_affinity_hyperparams = optimize_xgb_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best XGB affinity params: {xgb_affinity_hyperparams}")
+
+                if 'ridge_affinity' in models_to_opt:
+                    print(f"\nOptimising Ridge affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    ridge_affinity_hyperparams = optimize_ridge_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best Ridge affinity params: {ridge_affinity_hyperparams}")
+
+                if 'mlp_affinity' in models_to_opt:
+                    print(f"\nOptimising MLP affinity hyperparameters "
+                          f"(Optuna, {args.n_trials} trials × 5-fold KFold on train+val)...")
+                    mlp_affinity_hyperparams = optimize_mlp_affinity_hyperparams(
+                        train_aff, val_aff, feature_cols_aff, args.n_trials, storage=optuna_storage
+                    )
+                    print(f"  Best MLP affinity params: {mlp_affinity_hyperparams}")
 
             print("Training affinity models...")
             affinity_models = train_affinity_model(
                 train_aff, feature_cols_aff,
+                hyperparams_rf=rf_affinity_hyperparams,
                 hyperparams_gb=gb_affinity_hyperparams,
                 hyperparams_svr=svr_affinity_hyperparams,
                 hyperparams_xgb=xgb_affinity_hyperparams,
                 hyperparams_ridge=ridge_affinity_hyperparams,
+                hyperparams_mlp=mlp_affinity_hyperparams,
             )
 
             print("Evaluating affinity models (test)...")
@@ -3288,10 +3596,12 @@ def main():
                     'rf_ranker':      rf_hyperparams             or {},
                     'gb_ranker':      gb_hyperparams             or {},
                     'xgb_ranker':     xgb_hyperparams            or {},
+                    'rf_affinity':    rf_affinity_hyperparams    or {},
                     'gb_affinity':    gb_affinity_hyperparams    or {},
                     'svr_affinity':   svr_affinity_hyperparams   or {},
                     'xgb_affinity':   xgb_affinity_hyperparams   or {},
                     'ridge_affinity': ridge_affinity_hyperparams or {},
+                    'mlp_affinity':   mlp_affinity_hyperparams   or {},
                 }
                 hp_path = OUTPUT_DIR / 'best_hyperparams.json'
                 hp_path.write_text(json.dumps(best_hp, indent=2))
@@ -3307,6 +3617,150 @@ def main():
                     plot_affinity_predictions(val_affinity_metrics, OUTPUT_DIR, split='val')
                 except Exception as e:
                     print(f"Warning: Could not generate affinity plot: {e}")
+
+            # ---- Feature-set comparison: current features vs fingerprints only ----
+            if args.affinity_compare_features:
+                print("\n" + "=" * 60)
+                print("AFFINITY FEATURE-SET COMPARISON: current vs fingerprints")
+                print("=" * 60)
+
+                print("\nComputing Morgan fingerprints (ECFP4, 2048 bits) for all splits...")
+                train_aff_fp = augment_affinity_with_fingerprints(train_aff)
+                val_aff_fp   = augment_affinity_with_fingerprints(val_aff)
+                test_aff_fp  = augment_affinity_with_fingerprints(test_aff)
+
+                fp_cols = [c for c in train_aff_fp.columns if c.startswith('morgan_fp_')]
+                # Keep only fingerprint bits that have at least one non-NaN value
+                valid_fp_cols = [c for c in fp_cols
+                                 if train_aff_fp[c].notna().any()]
+                print(f"  {len(valid_fp_cols)} fingerprint bits with data (out of {len(fp_cols)})")
+
+                if len(valid_fp_cols) < 10:
+                    print("  Warning: Too few valid fingerprint bits. Skipping fingerprint models.")
+                else:
+                    # Optimise fingerprint models if requested (separate studies)
+                    if args.optimize_hyperparams:
+                        if 'rf_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising RF affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            rf_affinity_hp_fp = optimize_rf_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='rf_affinity_fp',
+                            )
+                            print(f"  Best RF fp params: {rf_affinity_hp_fp}")
+
+                        if 'gb_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising GB affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            gb_affinity_hp_fp = optimize_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='gb_affinity_fp',
+                            )
+                            print(f"  Best GB fp params: {gb_affinity_hp_fp}")
+
+                        if 'svr_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising SVR affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            svr_affinity_hp_fp = optimize_svr_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='svr_affinity_fp',
+                            )
+                            print(f"  Best SVR fp params: {svr_affinity_hp_fp}")
+
+                        if 'xgb_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising XGB affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            xgb_affinity_hp_fp = optimize_xgb_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='xgb_affinity_fp',
+                            )
+                            print(f"  Best XGB fp params: {xgb_affinity_hp_fp}")
+
+                        if 'ridge_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising Ridge affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            ridge_affinity_hp_fp = optimize_ridge_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='ridge_affinity_fp',
+                            )
+                            print(f"  Best Ridge fp params: {ridge_affinity_hp_fp}")
+
+                        if 'mlp_affinity_fp' in models_to_opt:
+                            print(f"\nOptimising MLP affinity hyperparameters (fingerprints, "
+                                  f"{args.n_trials} trials)...")
+                            mlp_affinity_hp_fp = optimize_mlp_affinity_hyperparams(
+                                train_aff_fp, val_aff_fp, valid_fp_cols,
+                                args.n_trials, storage=optuna_storage,
+                                study_name='mlp_affinity_fp',
+                            )
+                            print(f"  Best MLP fp params: {mlp_affinity_hp_fp}")
+
+                        # Save fingerprint hyperparameters to separate JSON
+                        fp_models_optimised = {
+                            'rf_affinity_fp', 'gb_affinity_fp', 'svr_affinity_fp',
+                            'xgb_affinity_fp', 'ridge_affinity_fp', 'mlp_affinity_fp',
+                        }
+                        if models_to_opt & fp_models_optimised:
+                            best_hp_fp = {
+                                'rf_affinity':    rf_affinity_hp_fp    or {},
+                                'gb_affinity':    gb_affinity_hp_fp    or {},
+                                'svr_affinity':   svr_affinity_hp_fp   or {},
+                                'xgb_affinity':   xgb_affinity_hp_fp   or {},
+                                'ridge_affinity': ridge_affinity_hp_fp or {},
+                                'mlp_affinity':   mlp_affinity_hp_fp   or {},
+                            }
+                            hp_fp_save = OUTPUT_DIR / 'best_hyperparams_fp.json'
+                            hp_fp_save.write_text(json.dumps(best_hp_fp, indent=2))
+                            print(f"\nSaved fingerprint hyperparameters to {hp_fp_save}")
+
+                    print("\nTraining affinity models on fingerprints only...")
+                    fp_affinity_models = train_affinity_model(
+                        train_aff_fp, valid_fp_cols,
+                        hyperparams_rf=rf_affinity_hp_fp,
+                        hyperparams_gb=gb_affinity_hp_fp,
+                        hyperparams_svr=svr_affinity_hp_fp,
+                        hyperparams_xgb=xgb_affinity_hp_fp,
+                        hyperparams_ridge=ridge_affinity_hp_fp,
+                        hyperparams_mlp=mlp_affinity_hp_fp,
+                    )
+
+                    print("Evaluating fingerprint affinity models (test)...")
+                    fp_affinity_metrics_test = evaluate_affinity_model(
+                        fp_affinity_models, test_aff_fp, valid_fp_cols)
+                    print("Evaluating fingerprint affinity models (val)...")
+                    fp_affinity_metrics_val = evaluate_affinity_model(
+                        fp_affinity_models, val_aff_fp, valid_fp_cols)
+
+                    # Side-by-side comparison tables
+                    print_affinity_comparison_table(
+                        affinity_metrics, fp_affinity_metrics_test,
+                        label_a='Current Features', label_b='Fingerprints Only',
+                        split='test',
+                    )
+                    print_affinity_comparison_table(
+                        val_affinity_metrics, fp_affinity_metrics_val,
+                        label_a='Current Features', label_b='Fingerprints Only',
+                        split='val',
+                    )
+
+                    if not args.no_plots:
+                        print("Generating fingerprint affinity scatter plots...")
+                        try:
+                            plot_affinity_predictions(
+                                affinity_metrics,        OUTPUT_DIR, split='current_test')
+                            plot_affinity_predictions(
+                                val_affinity_metrics,    OUTPUT_DIR, split='current_val')
+                            plot_affinity_predictions(
+                                fp_affinity_metrics_test, OUTPUT_DIR, split='fingerprints_test')
+                            plot_affinity_predictions(
+                                fp_affinity_metrics_val,  OUTPUT_DIR, split='fingerprints_val')
+                        except Exception as e:
+                            print(f"Warning: Could not generate fingerprint affinity plot: {e}")
     else:
         print("\nSkipping affinity prediction (--no-affinity set).")
 

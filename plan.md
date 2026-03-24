@@ -75,10 +75,16 @@ to the crystal ligand (standard docking benchmark).
 - Pocket volume / shape descriptors
 - Expected gain: +2–5 pp
 
-### Stage 6 — Neural network / deep learning [TODO]
-- Graph neural network on ligand + contact graph
-- Or gradient-boosted trees on expanded feature set
-- Expected gain: unknown, high variance
+### Stage 6 — Neural network / deep learning [IN PROGRESS]
+- **Script**: `gnn_affinity.py` (standalone, imports helpers from `process_pdbind.py`)
+- GINEConv-based GNN on ligand molecular graph (nodes = atoms, edges = bonds)
+- Node features: atom type, degree, charge, Hs, aromaticity, ring, hybridization (27 dims)
+- Edge features: bond type, conjugated, ring (6 dims)
+- Architecture: input projection → n_layers × GINEConv + BatchNorm + residual → mean+max pool → MLP head
+- Optuna: 3-fold CV, 50 epochs/fold, search over hidden_dim / n_layers / dropout / lr / batch_size
+- Outputs: `output/gnn_affinity_predictions.csv`, `output/gnn_affinity_predictions_{val,test}.png`, `output/gnn_model.pt`, `output/gnn_best_hyperparams.json`
+- Same train/val/test split as `process_pdbind.py` (load via `--load-csv`)
+- Expected gain: unknown
 
 ### Stage 7 — Analysis & reporting [TODO]
 - Per-protein-family performance breakdown
@@ -116,7 +122,7 @@ to the crystal ligand (standard docking benchmark).
 - [x] Ensemble (min-max normalised average)
 - [x] RF + GB affinity regressors (ΔG prediction)
 - [x] Hyperparameter optimisation (Optuna, RF ranker + GB affinity)
-- [ ] Neural network / GNN
+- [x] GNN affinity model (`gnn_affinity.py`, PyTorch Geometric)
 
 ### Evaluation & Output
 - [x] Best-pose selection rate
@@ -155,9 +161,9 @@ to the crystal ligand (standard docking benchmark).
 | 8 — Binding affinity prediction | Complete | 100% |
 | 4 — Hyperparameter optimisation | Complete | 100% |
 | 5 — Richer contact features | Not started | 0% |
-| 6 — Neural network | Not started | 0% |
+| 6 — Neural network / GNN | In Progress | 50% |
 | 7 — Analysis & reporting | Not started | 0% |
-| **Overall** | | **~65%** |
+| **Overall** | | **~72%** |
 
 ---
 
@@ -186,4 +192,4 @@ Priority order — edit/reorder as needed:
 
 ---
 
-*Last updated: 2026-03-06*
+*Last updated: 2026-03-23*

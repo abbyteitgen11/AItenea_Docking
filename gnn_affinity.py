@@ -83,6 +83,26 @@ NODE_DIM = (len(_ATOM_TYPES) + 1) + (len(_DEGREES) + 1) + 1 + 1 + 1 + 1 + (len(_
 EDGE_DIM = (len(_BOND_TYPES) + 1) + 2
 
 
+def print_feature_summary() -> None:
+    """Print a table describing all node and edge features used in the GNN."""
+    print("\n" + "=" * 60)
+    print("GRAPH FEATURE SUMMARY")
+    print("=" * 60)
+    print(f"Node features  ({NODE_DIM} dims total):")
+    print(f"  Atom type one-hot  : {len(_ATOM_TYPES)+1:2d}  (C N O S F Cl Br I P + other)")
+    print(f"  Degree one-hot     : {len(_DEGREES)+1:2d}  (0-6 + other)")
+    print(f"  Formal charge      :  1  (integer, clipped to [-2, 2])")
+    print(f"  Num implicit Hs    :  1  (integer, clipped to [0, 4])")
+    print(f"  Is aromatic        :  1  (bool)")
+    print(f"  Is in ring         :  1  (bool)")
+    print(f"  Hybridisation      : {len(_HYBRIDIZATIONS)+1:2d}  (SP SP2 SP3 SP3D SP3D2 + other)")
+    print(f"Edge features  ({EDGE_DIM} dims total):")
+    print(f"  Bond type one-hot  : {len(_BOND_TYPES)+1:2d}  (SINGLE DOUBLE TRIPLE AROMATIC + other)")
+    print(f"  Is conjugated      :  1  (bool)")
+    print(f"  Is in ring         :  1  (bool)")
+    print("=" * 60)
+
+
 def _one_hot(value, choices: list) -> List[float]:
     """One-hot encode value against choices; last bit is the 'other' category."""
     enc = [0.0] * (len(choices) + 1)
@@ -293,6 +313,25 @@ class AffinityGNN(nn.Module):
 # Training and evaluation
 # ---------------------------------------------------------------------------
 
+def make_loader(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    device: torch.device,
+) -> DataLoader:
+    """Create a DataLoader with pin_memory and num_workers tuned for the device."""
+    use_pin = device.type == 'cuda'
+    workers  = 4 if device.type == 'cuda' else 0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        pin_memory=use_pin,
+        num_workers=workers,
+        persistent_workers=(workers > 0),
+    )
+
+
 def train_epoch(
     model: AffinityGNN,
     loader: DataLoader,
@@ -383,8 +422,8 @@ def train_gnn(
         hidden_dim=hidden_dim, n_layers=n_layers, dropout=dropout,
     ).to(device)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    train_loader = make_loader(train_ds, batch_size=batch_size, shuffle=True,  device=device)
+    val_loader   = make_loader(val_ds,   batch_size=batch_size, shuffle=False, device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -441,6 +480,7 @@ def optimize_gnn_hyperparams(
     storage: Optional[str] = None,
     study_name: str = 'gnn_affinity',
     device: Optional[torch.device] = None,
+    output_dir: Optional[Path] = None,
 ) -> Dict:
     """
     Optuna search for GNN hyperparameters using 3-fold KFold CV on train+val combined.
@@ -473,8 +513,8 @@ def optimize_gnn_hyperparams(
         for train_idx, val_idx in kf.split(indices):
             train_sub = torch.utils.data.Subset(combined_ds, train_idx.tolist())
             val_sub   = torch.utils.data.Subset(combined_ds, val_idx.tolist())
-            t_loader  = DataLoader(train_sub, batch_size=hp['batch_size'], shuffle=True)
-            v_loader  = DataLoader(val_sub,   batch_size=hp['batch_size'], shuffle=False)
+            t_loader  = make_loader(train_sub, batch_size=hp['batch_size'], shuffle=True,  device=device)
+            v_loader  = make_loader(val_sub,   batch_size=hp['batch_size'], shuffle=False, device=device)
 
             fold_model = AffinityGNN(
                 node_dim=NODE_DIM, edge_dim=EDGE_DIM,
@@ -513,10 +553,43 @@ def optimize_gnn_hyperparams(
     n_existing = len(study.trials)
     if n_existing:
         print(f"  Loaded {n_existing} existing GNN Optuna trials from storage")
-    study.optimize(objective, n_trials=n_trials)
+    total_trials = n_existing + n_trials
+
+    def _trial_callback(
+        study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        print(f"  Trial {trial.number + 1:3d}/{total_trials}  "
+              f"MSE={trial.value:.6f}  best={study.best_value:.6f}  "
+              f"{trial.params}")
+
+    study.optimize(objective, n_trials=n_trials, callbacks=[_trial_callback])
     print(f"  GNN best CV MSE: {study.best_value:.6f} (over {len(study.trials)} total trials)")
     print(f"  Best params: {study.best_params}")
+    if output_dir is not None:
+        plot_optuna_trials(study, output_dir)
     return study.best_params
+
+
+def plot_optuna_trials(study: optuna.Study, output_dir: Path) -> None:
+    """Plot CV MSE per trial and the best-so-far curve."""
+    values = [t.value for t in study.trials if t.value is not None]
+    if not values:
+        return
+    trials_x    = list(range(1, len(values) + 1))
+    best_so_far = np.minimum.accumulate(values)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(trials_x, values, s=25, alpha=0.6, label='Trial CV MSE')
+    ax.plot(trials_x, best_so_far, color='crimson', lw=2, label='Best so far')
+    ax.set_xlabel('Trial number')
+    ax.set_ylabel('CV MSE (kcal/mol)\u00b2')
+    ax.set_title('Optuna GNN hyperparameter search')
+    ax.legend()
+    fig.tight_layout()
+    path = output_dir / 'gnn_optuna_trials.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved Optuna trial plot to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +734,7 @@ def main() -> None:
     else:
         device = torch.device(args.device)
     print(f"Using device: {device}")
+    print_feature_summary()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     optuna_storage = f"sqlite:///{args.optuna_db}" if args.optuna_db else None
@@ -723,6 +797,7 @@ def main() -> None:
             storage=optuna_storage,
             study_name='gnn_affinity',
             device=device,
+            output_dir=OUTPUT_DIR if not args.no_plots else None,
         )
         hp_save = OUTPUT_DIR / 'gnn_best_hyperparams.json'
         hp_save.write_text(json.dumps(hyperparams, indent=2))
@@ -738,7 +813,7 @@ def main() -> None:
     )
 
     # --- Evaluate on test set ---
-    test_loader = DataLoader(test_ds, batch_size=hyperparams.get('batch_size', 64), shuffle=False)
+    test_loader = make_loader(test_ds, batch_size=hyperparams.get('batch_size', 64), shuffle=False, device=device)
     y_true_test, y_pred_test = evaluate(model, test_loader, device)
     test_metrics = compute_metrics(y_true_test, y_pred_test)
 

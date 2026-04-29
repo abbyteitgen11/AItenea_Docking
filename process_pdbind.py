@@ -1261,6 +1261,10 @@ def train_ranker_model(
     Uses continuous RMSD-based relevance (1/(1+rmsd)) so the model learns to
     rank poses by proximity to the crystal structure rather than binary best/not-best.
 
+    Note: XGBoost 3.x ranking eval metrics require integer labels, so early stopping
+    via eval_set is not compatible with our continuous 1/(1+rmsd) target. The GB
+    ranker uses n_iter_no_change for early stopping instead.
+
     Args:
         train_df: DataFrame with pose-level features and rmsd column
         hyperparams: Optional dict of hyperparameters to override defaults
@@ -1832,7 +1836,9 @@ def train_gb_ranker(
     y_rel = 1.0 / (1.0 + train_df['rmsd'].values)
 
     params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
-              'subsample': 0.8, 'min_samples_leaf': 5, **(hyperparams or {})}
+              'subsample': 0.8, 'min_samples_leaf': 5,
+              'n_iter_no_change': 10, 'validation_fraction': 0.1, 'tol': 1e-4,
+              **(hyperparams or {})}
     model = GradientBoostingRegressor(**params, random_state=RANDOM_SEED)
     model.fit(X, y_rel)
     return model, feature_cols
@@ -2175,6 +2181,7 @@ def train_affinity_model(
     hyperparams_xgb: Optional[Dict] = None,
     hyperparams_ridge: Optional[Dict] = None,
     hyperparams_mlp: Optional[Dict] = None,
+    val_affinity_df: Optional[pd.DataFrame] = None,
 ) -> Dict:
     """
     Train RF, GB, SVR, XGBoost, Ridge, and MLP regressors to predict binding affinity (ΔG, kcal/mol).
@@ -2188,6 +2195,7 @@ def train_affinity_model(
         hyperparams_xgb:   Optional XGBRegressor hyperparameters.
         hyperparams_ridge: Optional Ridge hyperparameters (alpha).
         hyperparams_mlp:   Optional MLP hyperparameters (hidden_layer_sizes index, alpha, lr).
+        val_affinity_df:   Optional validation DataFrame for XGBoost early stopping.
 
     Returns:
         Dict mapping model name → (fitted model, feature_cols used).
@@ -2203,7 +2211,9 @@ def train_affinity_model(
     rf.fit(X, y)
 
     gb_params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
-                 'subsample': 0.8, 'min_samples_leaf': 5, **(hyperparams_gb or {})}
+                 'subsample': 0.8, 'min_samples_leaf': 5,
+                 'n_iter_no_change': 10, 'validation_fraction': 0.1, 'tol': 1e-4,
+                 **(hyperparams_gb or {})}
     gb = GradientBoostingRegressor(**gb_params, random_state=RANDOM_SEED)
     gb.fit(X, y)
 
@@ -2214,11 +2224,18 @@ def train_affinity_model(
     ])
     svr_pipe.fit(X, y)
 
-    xgb_params = {'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.05,
+    xgb_params = {'n_estimators': 500, 'max_depth': 5, 'learning_rate': 0.05,
                   'subsample': 0.8, 'colsample_bytree': 0.8, **(hyperparams_xgb or {})}
+    # early_stopping_rounds goes in the constructor in XGBoost 3.x
+    early_stop = 30 if val_affinity_df is not None else None
     xgb_reg = xgb.XGBRegressor(**xgb_params, random_state=RANDOM_SEED, n_jobs=-1,
-                                verbosity=0)
-    xgb_reg.fit(X, y)
+                                verbosity=0, early_stopping_rounds=early_stop)
+    if val_affinity_df is not None:
+        X_val = np.nan_to_num(val_affinity_df[available_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+        y_val = val_affinity_df['exp_affinity_kcal_mol'].values
+        xgb_reg.fit(X, y, eval_set=[(X_val, y_val)], verbose=False)
+    else:
+        xgb_reg.fit(X, y)
 
     ridge_alpha = (hyperparams_ridge or {}).get('alpha', 1.0)
     ridge_pipe = Pipeline([
@@ -3559,6 +3576,7 @@ def main():
                 hyperparams_xgb=xgb_affinity_hyperparams,
                 hyperparams_ridge=ridge_affinity_hyperparams,
                 hyperparams_mlp=mlp_affinity_hyperparams,
+                val_affinity_df=val_aff,
             )
 
             print("Evaluating affinity models (test)...")

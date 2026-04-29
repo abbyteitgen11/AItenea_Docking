@@ -4,6 +4,9 @@ index_general/
 output/
 P-L/
 P-L_general/
+PDBind_2020/
+PDBind_2020_index/
+CASF-2016/
 *.log
 *.tar.gz
 *.gz

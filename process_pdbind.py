@@ -40,9 +40,10 @@ import argparse
 
 
 # Configuration
-INDEX_DIR = Path("index")
-STRUCTURES_DIR = Path("P-L")
-OUTPUT_DIR = Path("output")
+INDEX_DIR      = Path("PDBind_2020_index")
+STRUCTURES_DIR = Path("PDBind_2020")
+CASF_DIR       = Path("CASF-2016/coreset")
+OUTPUT_DIR     = Path("output")
 VINA_EXECUTABLE = Path("/Applications/autodock_vina_1_1_2_mac_catalina_64bit/bin/vina")  # Adjust path for your system
 
 # Constants
@@ -186,44 +187,77 @@ def get_complexes() -> List[str]:
     """
     if not STRUCTURES_DIR.exists():
         raise FileNotFoundError(f"Structures directory not found: {STRUCTURES_DIR}")
-    
+
+    # Exclude CASF-2016 complexes — they are reserved for the fixed test set
+    casf_codes = load_casf_pdb_codes() if CASF_DIR.exists() else set()
+
     valid_complexes = []
-    
+
     for pdb_dir in STRUCTURES_DIR.rglob("*"):
         if not pdb_dir.is_dir():
             continue
-        
+
         pdb_code = pdb_dir.name
+        if pdb_code in casf_codes:
+            continue  # skip — goes to CASF test set
+
         ligand_file = pdb_dir / f"{pdb_code}_ligand.mol2"
         protein_file = pdb_dir / f"{pdb_code}_protein.pdb"
-        
+
         if ligand_file.exists() and protein_file.exists():
             valid_complexes.append(pdb_code)
-    
-    # Sort by year order (oldest to newest) to process in chronological order
+
     valid_complexes.sort()
-    
     return valid_complexes
 
 
 def get_complex_path(pdb_code: str) -> Path:
     """
     Find the full path to a complex directory given its PDB code.
-    
+    Checks CASF_DIR first (direct lookup), then searches STRUCTURES_DIR recursively
+    to handle year-based subdirectory layouts (e.g. PDBind_2020/1981-2000/pdb_code/).
+
     Args:
         pdb_code: The PDB code to find
-        
+
     Returns:
         Path to the complex directory
-        
+
     Raises:
         FileNotFoundError: If the complex directory is not found
     """
+    # Fast direct check in CASF_DIR (no rglob needed)
+    if CASF_DIR.exists():
+        casf_path = CASF_DIR / pdb_code
+        if casf_path.is_dir():
+            return casf_path
+    # Recursive search in STRUCTURES_DIR (handles year subdirs)
     for pdb_dir in STRUCTURES_DIR.rglob(pdb_code):
         if pdb_dir.is_dir():
             return pdb_dir
-    
     raise FileNotFoundError(f"Complex directory not found for {pdb_code}")
+
+
+def load_casf_pdb_codes(casf_dir: Path = CASF_DIR) -> set:
+    """Return the set of PDB codes in the CASF-2016 coreset directory."""
+    if not casf_dir.exists():
+        raise FileNotFoundError(f"CASF directory not found: {casf_dir}")
+    return {d.name for d in casf_dir.iterdir() if d.is_dir()}
+
+
+def get_casf_complexes(casf_dir: Path = CASF_DIR) -> List[str]:
+    """Return sorted list of valid CASF-2016 PDB codes (ligand.mol2 + protein.pdb present)."""
+    if not casf_dir.exists():
+        raise FileNotFoundError(f"CASF directory not found: {casf_dir}")
+    valid = []
+    for pdb_dir in sorted(casf_dir.iterdir()):
+        if not pdb_dir.is_dir():
+            continue
+        code = pdb_dir.name
+        if (pdb_dir / f"{code}_ligand.mol2").exists() and \
+           (pdb_dir / f"{code}_protein.pdb").exists():
+            valid.append(code)
+    return valid
 
 
 def define_binding_site(protein_pdb: str, ligand_mol2: str) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
@@ -791,8 +825,10 @@ def augment_with_mol2_features(df: pd.DataFrame) -> pd.DataFrame:
     mol2_cache: Dict[str, Dict] = {}
 
     for pdb_code in df['pdb_code'].unique():
-        # Use direct path instead of slow rglob
-        ligand_mol2 = STRUCTURES_DIR / pdb_code / f"{pdb_code}_ligand.mol2"
+        try:
+            ligand_mol2 = get_complex_path(pdb_code) / f"{pdb_code}_ligand.mol2"
+        except FileNotFoundError:
+            continue
         if not ligand_mol2.exists():
             continue
         features = extract_rdkit_features(str(ligand_mol2))
@@ -1101,7 +1137,10 @@ def augment_with_contact_features(df: pd.DataFrame) -> pd.DataFrame:
 
     found = 0
     for pdb_code in df['pdb_code'].unique():
-        protein_pdb = STRUCTURES_DIR / pdb_code / f"{pdb_code}_protein.pdb"
+        try:
+            protein_pdb = get_complex_path(pdb_code) / f"{pdb_code}_protein.pdb"
+        except FileNotFoundError:
+            continue
         pdbqt_file = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
 
         if not protein_pdb.exists() or not pdbqt_file.exists():
@@ -2995,26 +3034,32 @@ def split_val_from_train(
     )
 
 
-def process_all_complexes(num_complexes: Optional[int] = None) -> List[Dict]:
+def process_all_complexes(
+    num_complexes: Optional[int] = None,
+    complexes: Optional[List[str]] = None,
+) -> List[Dict]:
     """
-    Process all complexes and run Vina docking.
-    
+    Process complexes and run Vina docking.
+
     Args:
-        num_complexes: Limit number of complexes (None for all)
-    
+        num_complexes: Limit number of complexes (None for all). Ignored when
+                       `complexes` is provided explicitly.
+        complexes:     Explicit list of PDB codes to process. If None, discovers
+                       non-CASF complexes from STRUCTURES_DIR via get_complexes().
+
     Returns:
         List of Vina results with pose coordinates and RMSDs
     """
     print("Loading binding data...")
     binding_data = load_binding_data()
     print(f"Loaded {len(binding_data)} binding affinity records")
-    
-    print("Finding valid complexes...")
-    complexes = get_complexes()
-    print(f"Found {len(complexes)} valid complexes")
-    
-    if num_complexes:
-        complexes = complexes[:num_complexes]
+
+    if complexes is None:
+        print("Finding valid complexes...")
+        complexes = get_complexes()
+        print(f"Found {len(complexes)} valid complexes")
+        if num_complexes:
+            complexes = complexes[:num_complexes]
     
     vina_results = []
     
@@ -3054,17 +3099,24 @@ def main():
         '--load-csv',
         nargs='+',
         metavar='CSV',
-        help='Load existing CSV files instead of running Vina. '
+        help='Load pre-computed pose CSVs instead of running Vina. '
              'Provide TRAIN_CSV TEST_CSV [VAL_CSV]. '
+             'TEST_CSV should be the fixed CASF-2016 set. '
              'If VAL_CSV is omitted, a validation set is carved from TRAIN_CSV '
              'using --val-frac.'
     )
     parser.add_argument(
         '--val-frac',
         type=float,
-        default=0.2,
-        help='Fraction of training complexes to reserve as validation set '
-             'when VAL_CSV is not supplied via --load-csv (default: 0.2)'
+        default=0.1,
+        help='Fraction of non-CASF complexes to reserve as validation set '
+             '(default: 0.1)'
+    )
+    parser.add_argument(
+        '--casf-dir',
+        type=str,
+        default=str(CASF_DIR),
+        help=f'Path to CASF-2016 coreset directory (default: {CASF_DIR})'
     )
     parser.add_argument(
         '--num-complexes',
@@ -3178,39 +3230,46 @@ def main():
                   f"{train_df['pdb_code'].nunique()} complexes "
                   f"({train_df.shape[0]} poses)")
     else:
-        # Process complexes with Vina
-        num_complexes = args.num_complexes
-        vina_results = process_all_complexes(num_complexes)
+        # --- Process CASF-2016 complexes (fixed test set) ---
+        casf_dir = Path(args.casf_dir)
+        print(f"\nProcessing CASF-2016 test complexes from {casf_dir}...")
+        casf_codes_list = get_casf_complexes(casf_dir)
+        print(f"Found {len(casf_codes_list)} valid CASF-2016 complexes")
+        casf_vina_results = process_all_complexes(complexes=casf_codes_list)
+        print(f"Processed {len(casf_vina_results)} CASF-2016 complexes successfully")
+        test_df = prepare_training_data(casf_vina_results)
 
-        print(f"\nProcessed {len(vina_results)} complexes successfully")
+        # --- Process PDBind_2020 non-CASF complexes (train + val pool) ---
+        print(f"\nProcessing PDBind_2020 train/val complexes (CASF excluded)...")
+        vina_results = process_all_complexes(num_complexes=args.num_complexes)
+        print(f"Processed {len(vina_results)} PDBind_2020 complexes successfully")
+        pool_df = prepare_training_data(vina_results)
 
-        # Prepare training data
-        print("Preparing training data...")
-        train_df = prepare_training_data(vina_results)
-        print(f"Training data shape: {train_df.shape}")
-
-        if len(train_df) < 10:
-            print("Not enough data for training")
+        if len(pool_df) < 10:
+            print("Not enough train/val data for training")
             return
 
-        # Split data by complex (not by pose): train / val / test
-        unique_complexes = train_df['pdb_code'].unique()
-        remaining_complexes, test_complexes = train_test_split(
-            unique_complexes, test_size=0.2, random_state=RANDOM_SEED
-        )
+        # Split pool into 90% train / 10% val by complex
+        unique_complexes = pool_df['pdb_code'].unique()
         train_complexes, val_complexes = train_test_split(
-            remaining_complexes, test_size=0.2, random_state=RANDOM_SEED
+            unique_complexes, test_size=args.val_frac, random_state=RANDOM_SEED
         )
+        train_df_final = pool_df[pool_df['pdb_code'].isin(train_complexes)].copy()
+        val_df         = pool_df[pool_df['pdb_code'].isin(val_complexes)].copy()
 
-        train_df_final = train_df[train_df['pdb_code'].isin(train_complexes)].copy()
-        val_df         = train_df[train_df['pdb_code'].isin(val_complexes)].copy()
-        test_df        = train_df[train_df['pdb_code'].isin(test_complexes)].copy()
+        print(f"\nDataset split summary:")
+        print(f"  Test  (CASF-2016) : {test_df['pdb_code'].nunique()} complexes "
+              f"({test_df.shape[0]} poses)")
+        print(f"  Train             : {train_df_final['pdb_code'].nunique()} complexes "
+              f"({train_df_final.shape[0]} poses)")
+        print(f"  Val               : {val_df['pdb_code'].nunique()} complexes "
+              f"({val_df.shape[0]} poses)")
 
-        # Save results
+        # Save fixed CSVs (reused for all subsequent --load-csv runs)
         train_df_final.to_csv(OUTPUT_DIR / "training_data.csv", index=False)
         val_df.to_csv(OUTPUT_DIR / "val_data.csv", index=False)
         test_df.to_csv(OUTPUT_DIR / "test_data.csv", index=False)
-        print(f"Results saved to {OUTPUT_DIR}")
+        print(f"Fixed train/val/test CSVs saved to {OUTPUT_DIR}/")
 
         train_df = train_df_final
 

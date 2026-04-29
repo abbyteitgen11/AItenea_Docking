@@ -1,12 +1,14 @@
 # AItenea Docking — ML Rescoring of AutoDock Vina Poses
 
-Machine learning rescoring of AutoDock Vina docking poses on the PDBbind general set
-(~5,300 protein–ligand complexes). Two goals:
+Machine learning rescoring of AutoDock Vina docking poses on the PDBbind 2020 general set
+(~19,000 protein–ligand complexes). Two goals:
 
 1. **Pose ranking** — select the docking pose closest to the crystal structure better than
    Vina's native ranking.
 2. **Binding affinity prediction** — predict experimental ΔG (kcal/mol) from docking
    features and/or molecular fingerprints.
+
+Test set: **CASF-2016** (285 complexes), used as a fixed benchmark.
 
 ---
 
@@ -42,13 +44,71 @@ activated environment.
 | Affinity prediction | GB regressor (optimised) | Pearson r | **0.649** |
 | Affinity prediction | RF regressor | Pearson r | 0.634 |
 
-Test set: 1,060 complexes from the PDBbind general set (2020 release).
+Test set: CASF-2016 benchmark (285 complexes). Results above are from the previous refined-set run; will be updated after full PDBbind 2020 retraining.
 
 ---
 
 ## process_pdbind.py
 
-### Typical usage
+### Initial run — Vina docking and CSV generation
+
+This step runs AutoDock Vina on every complex, extracts features, and writes the three
+fixed CSV files that are reused for all subsequent training runs.  It only needs to be
+done once (or whenever the underlying structures change).
+
+**Required directory layout before running:**
+
+```
+AItenea_Docking/
+├── PDBind_2020/
+│   ├── 1981-2000/{pdb_code}/{pdb_code}_ligand.mol2 + _protein.pdb
+│   ├── 2001-2010/{pdb_code}/...
+│   └── 2011-2019/{pdb_code}/...
+├── PDBind_2020_index/
+│   └── INDEX_general_PL.2020R1.lst
+└── CASF-2016/
+    └── coreset/{pdb_code}/{pdb_code}_ligand.mol2 + _protein.pdb
+```
+
+**Full run — process all PDBbind 2020 complexes + CASF-2016 test set (~many hours):**
+
+```bash
+python process_pdbind.py --num-complexes 19000
+```
+
+This will:
+1. Run Vina on all 285 CASF-2016 complexes → `output/test_data.csv`
+2. Run Vina on all non-CASF PDBbind 2020 complexes
+3. Split non-CASF complexes 90% train / 10% val → `output/training_data.csv` + `output/val_data.csv`
+
+**Speed up with `--no-augment` (skip mol2 + contact features, much faster but lower accuracy):**
+
+```bash
+python process_pdbind.py --num-complexes 19000 --no-augment
+```
+
+**Override the CASF directory or validation fraction:**
+
+```bash
+python process_pdbind.py \
+  --num-complexes 19000 \
+  --casf-dir CASF-2016/coreset \
+  --val-frac 0.1
+```
+
+**Smoke-test with a small subset first:**
+
+```bash
+# Process 20 non-CASF complexes + all CASF — quick sanity check
+python process_pdbind.py --num-complexes 20
+```
+
+Once the three CSVs are saved you should not need to re-run Vina. Use `--load-csv` for
+all subsequent training and evaluation (see below).
+
+---
+
+### Typical usage (after CSVs are generated)
 
 ```bash
 # Fast iteration — load pre-computed CSVs, train all models, run affinity prediction
@@ -104,9 +164,10 @@ python process_pdbind.py \
 
 | Flag | Default | Description |
 |---|---|---|
-| `--load-csv TRAIN TEST [VAL]` | — | Load pre-computed pose CSVs instead of running Vina. If VAL is omitted, a val set is carved from TRAIN using `--val-frac`. |
-| `--val-frac F` | `0.2` | Fraction of training complexes to hold out as validation when VAL CSV is not provided. |
-| `--num-complexes N` | `10` | Number of complexes to process when running Vina from scratch (not used with `--load-csv`). |
+| `--load-csv TRAIN TEST [VAL]` | — | Load pre-computed pose CSVs instead of running Vina. TEST should be the CASF-2016 set. If VAL is omitted, a val set is carved from TRAIN using `--val-frac`. |
+| `--val-frac F` | `0.1` | Fraction of non-CASF complexes to hold out as validation during the initial Vina run, or when VAL CSV is not provided with `--load-csv`. |
+| `--num-complexes N` | `10` | Max number of non-CASF PDBbind 2020 complexes to process when running Vina (CASF-2016 is always processed in full). |
+| `--casf-dir PATH` | `CASF-2016/coreset` | Path to the CASF-2016 coreset directory. |
 | `--no-plots` | off | Skip all plot generation. |
 | `--no-augment` | off | Skip mol2 descriptor and PDBQT geometry feature augmentation (faster but lower accuracy). |
 | `--no-contact-features` | off | Skip protein–ligand contact feature computation (KDTree-based). |
@@ -273,16 +334,24 @@ AItenea_Docking/
 ├── process_pdbind.py          # Main ML pipeline
 ├── gnn_affinity.py            # GNN affinity model
 ├── plan.md                    # Development plan and progress
-├── index/
+├── PDBind_2020/               # PDBbind 2020 full general set (~19,000 complexes)
+│   ├── 1981-2000/
+│   │   └── {pdb_code}/
+│   │       ├── {pdb_code}_ligand.mol2
+│   │       └── {pdb_code}_protein.pdb
+│   ├── 2001-2010/{pdb_code}/...
+│   └── 2011-2019/{pdb_code}/...
+├── PDBind_2020_index/
 │   └── INDEX_general_PL.2020R1.lst   # PDBbind affinity labels
-├── P-L/
-│   └── {pdb_code}/
-│       ├── {pdb_code}_ligand.mol2
-│       └── {pdb_code}_protein.pdb
+├── CASF-2016/
+│   └── coreset/               # Fixed benchmark test set (285 complexes)
+│       └── {pdb_code}/
+│           ├── {pdb_code}_ligand.mol2
+│           └── {pdb_code}_protein.pdb
 └── output/
-    ├── training_data.csv
+    ├── training_data.csv      # Generated by initial Vina run; reused with --load-csv
     ├── val_data.csv
-    ├── test_data.csv
+    ├── test_data.csv          # CASF-2016 complexes
     ├── best_hyperparams.json
     ├── best_hyperparams_fp.json
     ├── gnn_best_hyperparams.json
@@ -295,10 +364,11 @@ AItenea_Docking/
 ## Recommended workflow
 
 ```bash
-# 1. Generate features and train all models (first time only — slow, runs Vina)
-python process_pdbind.py --num-complexes 5302
+# 1. Run Vina on all complexes and generate fixed CSVs (first time only — slow)
+#    CASF-2016 → test_data.csv; PDBind_2020 non-CASF → training_data.csv + val_data.csv
+python process_pdbind.py --num-complexes 19000
 
-# 2. Fast iteration on saved CSVs
+# 2. Fast iteration on saved CSVs (no Vina, no augmentation re-run)
 python process_pdbind.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
 

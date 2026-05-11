@@ -28,6 +28,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+import joblib
 import json
 import optuna
 from sklearn.model_selection import train_test_split, GroupKFold, KFold
@@ -503,16 +504,23 @@ def calculate_all_pose_rmsds(vina_result: Dict, pdb_code: str) -> Optional[List[
     return rmsds
 
 
-def run_vina(pdb_code: str) -> Optional[Dict]:
+def run_vina(
+    pdb_code: str,
+    exhaustiveness: int = 8,
+    vina_executable: Optional[Path] = None,
+) -> Optional[Dict]:
     """
     Run AutoDock Vina on a single complex.
-    
+
     Args:
         pdb_code: PDB code of the complex
-    
+        exhaustiveness: Vina exhaustiveness parameter (default: 8)
+        vina_executable: Path to Vina binary; defaults to VINA_EXECUTABLE constant
+
     Returns:
         Dictionary with docking results including pose coordinates, or None if failed
     """
+    exe = vina_executable if vina_executable is not None else VINA_EXECUTABLE
     try:
         pdb_dir = get_complex_path(pdb_code)
     except FileNotFoundError:
@@ -564,7 +572,7 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
     
     # Run Vina
     vina_cmd = [
-        str(VINA_EXECUTABLE),
+        str(exe),
         '--receptor', str(vina_input),
         '--ligand', str(vina_ligand),
         '--center_x', str(center[0]),
@@ -575,7 +583,7 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
         '--size_z', str(size[2]),
         '--out', str(vina_output),
         '--num_modes', str(NUM_TOP_POSES),
-        '--exhaustiveness', '8'
+        '--exhaustiveness', str(exhaustiveness)
     ]
     
     result = subprocess.run(vina_cmd, capture_output=True, text=True)
@@ -613,6 +621,28 @@ def run_vina(pdb_code: str) -> Optional[Dict]:
         'center': center,
         'size': size
     }
+
+
+def _vina_worker(args: tuple) -> Optional[Dict]:
+    """Top-level worker for parallel Vina docking (must be module-level for pickling).
+
+    Args:
+        args: (pdb_code, affinity_nM, exhaustiveness, vina_executable)
+
+    Returns:
+        Complete result dict (vina result + rmsds + affinity_nM), or None on failure.
+    """
+    pdb_code, affinity_nM, exhaustiveness, vina_executable = args
+    vina_result = run_vina(pdb_code, exhaustiveness=exhaustiveness, vina_executable=vina_executable)
+    if vina_result is None:
+        return None
+    rmsds = calculate_all_pose_rmsds(vina_result, pdb_code)
+    if rmsds is None:
+        print(f"  Could not calculate RMSDs for {pdb_code}, skipping")
+        return None
+    vina_result['rmsds'] = rmsds
+    vina_result['affinity_nM'] = affinity_nM
+    return vina_result
 
 
 def extract_rdkit_features(ligand_mol2: str) -> Optional[Dict]:
@@ -3037,19 +3067,28 @@ def split_val_from_train(
 def process_all_complexes(
     num_complexes: Optional[int] = None,
     complexes: Optional[List[str]] = None,
+    n_jobs: int = 1,
+    exhaustiveness: int = 8,
+    vina_executable: Optional[Path] = None,
 ) -> List[Dict]:
     """
     Process complexes and run Vina docking.
 
     Args:
-        num_complexes: Limit number of complexes (None for all). Ignored when
-                       `complexes` is provided explicitly.
-        complexes:     Explicit list of PDB codes to process. If None, discovers
-                       non-CASF complexes from STRUCTURES_DIR via get_complexes().
+        num_complexes:    Limit number of complexes (None for all). Ignored when
+                          `complexes` is provided explicitly.
+        complexes:        Explicit list of PDB codes to process. If None, discovers
+                          non-CASF complexes from STRUCTURES_DIR via get_complexes().
+        n_jobs:           Number of parallel workers (1 = sequential, -1 = all CPUs).
+        exhaustiveness:   Vina exhaustiveness parameter (default: 8).
+        vina_executable:  Path to Vina binary; defaults to VINA_EXECUTABLE constant.
 
     Returns:
         List of Vina results with pose coordinates and RMSDs
     """
+    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     print("Loading binding data...")
     binding_data = load_binding_data()
     print(f"Loaded {len(binding_data)} binding affinity records")
@@ -3060,30 +3099,64 @@ def process_all_complexes(
         print(f"Found {len(complexes)} valid complexes")
         if num_complexes:
             complexes = complexes[:num_complexes]
-    
+
+    # Pre-build affinity lookup and filter to complexes with binding data
+    affinity_lookup = binding_data.set_index('pdb_code')['affinity_nM'].to_dict()
+    valid_complexes = [c for c in complexes if c in affinity_lookup]
+    skipped = len(complexes) - len(valid_complexes)
+    if skipped:
+        print(f"  Skipping {skipped} complexes with no binding data")
+
+    worker_args = [
+        (code, affinity_lookup[code], exhaustiveness, vina_executable)
+        for code in valid_complexes
+    ]
+
+    n_workers = n_jobs if n_jobs > 0 else None  # None → os.cpu_count()
+
+    def _eta_str(elapsed: float, done: int, total: int) -> str:
+        if done == 0 or elapsed == 0:
+            return "ETA: --"
+        rate = done / elapsed
+        remaining = (total - done) / rate
+        h, rem = divmod(int(remaining), 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"ETA: {h}h {m}m"
+        elif m:
+            return f"ETA: {m}m {s}s"
+        else:
+            return f"ETA: {s}s"
+
     vina_results = []
-    
-    for i, pdb_code in enumerate(complexes):
-        print(f"Processing {pdb_code} ({i+1}/{len(complexes)})...")
-        
-        # Check if complex has binding data
-        binding_row = binding_data[binding_data['pdb_code'] == pdb_code]
-        if len(binding_row) == 0:
-            print(f"  No binding data for {pdb_code}, skipping")
-            continue
-        
-        # Run Vina
-        vina_result = run_vina(pdb_code)
-        if vina_result:
-            # Calculate RMSDs
-            rmsds = calculate_all_pose_rmsds(vina_result, pdb_code)
-            if rmsds is not None:
-                vina_result['rmsds'] = rmsds
-                vina_result['affinity_nM'] = binding_row['affinity_nM'].values[0]
-                vina_results.append(vina_result)
-            else:
-                print(f"  Could not calculate RMSDs for {pdb_code}, skipping")
-    
+
+    if n_workers == 1:
+        t0 = time.time()
+        for i, args in enumerate(worker_args):
+            eta = _eta_str(time.time() - t0, i, len(worker_args))
+            print(f"Processing {args[0]} ({i+1}/{len(worker_args)}) {eta}...")
+            result = _vina_worker(args)
+            if result is not None:
+                vina_results.append(result)
+    else:
+        print(f"Running Vina in parallel with {n_workers if n_workers else 'all'} workers...")
+        t0 = time.time()
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_vina_worker, a): a[0] for a in worker_args}
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                pdb_code = futures[future]
+                eta = _eta_str(time.time() - t0, completed, len(worker_args))
+                print(f"  [{completed}/{len(worker_args)}] {pdb_code} done — {eta}")
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"  Error processing {pdb_code}: {e}")
+                    result = None
+                if result is not None:
+                    vina_results.append(result)
+
     return vina_results
 
 
@@ -3123,6 +3196,26 @@ def main():
         type=int,
         default=10,
         help='Number of complexes to process (default: 10)'
+    )
+    parser.add_argument(
+        '--n-jobs',
+        type=int,
+        default=1,
+        help='Number of parallel Vina workers (default: 1 = sequential). '
+             'Use -1 for all available CPUs.'
+    )
+    parser.add_argument(
+        '--exhaustiveness',
+        type=int,
+        default=8,
+        help='Vina exhaustiveness parameter (default: 8). Higher = more thorough but slower.'
+    )
+    parser.add_argument(
+        '--vina-executable',
+        type=str,
+        default=None,
+        help='Path to Vina binary (overrides built-in VINA_EXECUTABLE). '
+             'Use to point at AutoDock-GPU or Vina-GPU for GPU acceleration.'
     )
     parser.add_argument(
         '--no-plots',
@@ -3235,13 +3328,24 @@ def main():
         print(f"\nProcessing CASF-2016 test complexes from {casf_dir}...")
         casf_codes_list = get_casf_complexes(casf_dir)
         print(f"Found {len(casf_codes_list)} valid CASF-2016 complexes")
-        casf_vina_results = process_all_complexes(complexes=casf_codes_list)
+        vina_exec = Path(args.vina_executable) if args.vina_executable else None
+        casf_vina_results = process_all_complexes(
+            complexes=casf_codes_list,
+            n_jobs=args.n_jobs,
+            exhaustiveness=args.exhaustiveness,
+            vina_executable=vina_exec,
+        )
         print(f"Processed {len(casf_vina_results)} CASF-2016 complexes successfully")
         test_df = prepare_training_data(casf_vina_results)
 
         # --- Process PDBind_2020 non-CASF complexes (train + val pool) ---
         print(f"\nProcessing PDBind_2020 train/val complexes (CASF excluded)...")
-        vina_results = process_all_complexes(num_complexes=args.num_complexes)
+        vina_results = process_all_complexes(
+            num_complexes=args.num_complexes,
+            n_jobs=args.n_jobs,
+            exhaustiveness=args.exhaustiveness,
+            vina_executable=vina_exec,
+        )
         print(f"Processed {len(vina_results)} PDBind_2020 complexes successfully")
         pool_df = prepare_training_data(vina_results)
 
@@ -3805,6 +3909,13 @@ def main():
                         hyperparams_ridge=ridge_affinity_hp_fp,
                         hyperparams_mlp=mlp_affinity_hp_fp,
                     )
+
+                    svr_fp_path = OUTPUT_DIR / 'svr_affinity_fp_model.joblib'
+                    joblib.dump(fp_affinity_models['svr_affinity'][0], svr_fp_path)
+                    svr_fp_meta = {'feature_cols': valid_fp_cols, 'n_bits': 2048}
+                    (OUTPUT_DIR / 'svr_affinity_fp_metadata.json').write_text(
+                        json.dumps(svr_fp_meta, indent=2))
+                    print(f"Saved SVR+fingerprints model to {svr_fp_path}")
 
                     print("Evaluating fingerprint affinity models (test)...")
                     fp_affinity_metrics_test = evaluate_affinity_model(

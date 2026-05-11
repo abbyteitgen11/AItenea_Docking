@@ -30,6 +30,7 @@ activated environment.
 |---|---|
 | `process_pdbind.py` | Full pipeline: Vina docking → feature extraction → ML pose ranking + affinity prediction |
 | `gnn_affinity.py` | GNN-based binding affinity prediction (PyTorch Geometric) |
+| `predict_affinity.py` | Standalone inference: predict ΔG for new ligands from pre-trained models |
 
 ---
 
@@ -222,6 +223,8 @@ python process_pdbind.py \
 | `output/test_data.csv` | Per-pose test features |
 | `output/best_hyperparams.json` | Best hyperparameters (current features) |
 | `output/best_hyperparams_fp.json` | Best hyperparameters (fingerprints; with `--affinity-compare-features`) |
+| `output/svr_affinity_fp_model.joblib` | Trained SVR+fingerprints pipeline (with `--affinity-compare-features`) |
+| `output/svr_affinity_fp_metadata.json` | Fingerprint column names and bit count for the SVR model |
 | `output/pose_selection_metrics.txt` | Pose ranking metrics for all models |
 | `output/score_comparison.csv` | Per-pose scores from all rankers |
 | `output/affinity_predictions.csv` | Per-complex predicted vs experimental ΔG |
@@ -324,6 +327,76 @@ Ligand mol2 file
 | `output/gnn_affinity_predictions_test.png` | Scatter plot — test set |
 | `output/gnn_affinity_predictions_val.png` | Scatter plot — validation set |
 | `output/gnn_optuna_trials.png` | Optuna CV MSE vs trial number |
+
+---
+
+## predict_affinity.py
+
+Standalone inference script for integrating the best trained models into a drug
+discovery workflow. Given Vina-docked poses for one or more novel ligands,
+predicts binding affinity (ΔG, kcal/mol) using either the SVR+fingerprints or
+GNN model. No retraining or PDBbind data required at inference time.
+
+Both models are per-ligand (they use molecular structure, not pose coordinates),
+so all poses of the same ligand receive the same predicted ΔG. Output is
+formatted per-pose for easy downstream use.
+
+> See **[PREDICT_AFFINITY_GUIDE.md](PREDICT_AFFINITY_GUIDE.md)** for full
+> instructions: prerequisites, input formats, and troubleshooting.
+
+### Quick start
+
+```bash
+# 1. Train and save models (only needed once after training)
+python process_pdbind.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --affinity-compare-features        # saves svr_affinity_fp_model.joblib
+
+python gnn_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
+  # saves gnn_model.pt
+
+# 2. Create a manifest CSV (one row per ligand)
+# ligand_id,ligand_mol2,protein_pdb,vina_pdbqt
+# lig1,inputs/lig1.mol2,inputs/protein.pdb,inputs/lig1_poses.pdbqt
+# ...
+
+# 3. Predict with SVR+fingerprints (fast, CPU)
+python predict_affinity.py \
+    --manifest inputs/manifest.csv \
+    --model svr_fp \
+    --output predictions.csv
+
+# 4. Or predict with GNN
+python predict_affinity.py \
+    --manifest inputs/manifest.csv \
+    --model gnn \
+    --output predictions.csv
+```
+
+### All flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--manifest PATH` | required | Manifest CSV: `ligand_id`, `ligand_mol2`, `protein_pdb`, `vina_pdbqt` |
+| `--model` | required | `svr_fp` (SVR+fingerprints) or `gnn` (Graph Neural Network) |
+| `--svr-model PATH` | `output/svr_affinity_fp_model.joblib` | Saved SVR pipeline |
+| `--svr-meta PATH` | `output/svr_affinity_fp_metadata.json` | SVR fingerprint metadata |
+| `--gnn-model PATH` | `output/gnn_model.pt` | Saved GNN checkpoint |
+| `--device` | `auto` | GNN device: `auto`, `cuda`, `mps`, or `cpu` |
+| `--output PATH` | `predictions.csv` | Output CSV |
+
+### Output
+
+One row per (ligand, pose):
+
+| Column | Description |
+|---|---|
+| `ligand_id` | From the manifest |
+| `pose_idx` | Vina pose number (1-based) |
+| `vina_score` | Vina score for this pose (kcal/mol) |
+| `predicted_affinity_kcal_mol` | ML-predicted ΔG (kcal/mol); same for all poses of one ligand |
+| `model` | `svr_fp` or `gnn` |
 
 ---
 

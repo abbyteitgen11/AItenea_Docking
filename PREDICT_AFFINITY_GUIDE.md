@@ -8,17 +8,38 @@ from the AItenea Docking pipeline.
 
 ## Overview
 
-Two models are available:
+Five models are available, split into two categories:
 
-| Model | Key | Input | Speed |
-|---|---|---|---|
-| SVR + Morgan fingerprints | `svr_fp` | ECFP4 fingerprint (2048 bits) from ligand mol2 | Fast (CPU) |
-| Graph Neural Network | `gnn` | Molecular graph (atoms + bonds) from ligand mol2 | Moderate (GPU optional) |
+### Per-ligand models (same ΔG for every pose of a ligand)
 
-**Both models are per-ligand.** They use only molecular structure — not
-pose coordinates — so all docking poses of the same ligand receive the same
-predicted ΔG. The output table includes one row per (ligand, pose) so the
-predictions sit alongside Vina scores for easy comparison.
+| Model | Key | Input |
+|---|---|---|
+| SVR + Morgan fingerprints | `svr_fp` | ECFP4 fingerprint (2048 bits) from ligand mol2 |
+| Graph Neural Network | `gnn` | Molecular graph (atoms + bonds) from ligand mol2 |
+
+These models use only molecular structure — not pose coordinates — so all
+docking poses of the same ligand receive the same predicted ΔG. The output
+includes one row per (ligand, pose) so predictions sit alongside Vina scores.
+
+### Pose-aware models (different ΔG per pose)
+
+| Model | Key | Input |
+|---|---|---|
+| Pose-aware SVR + fingerprints | `svr_fp_pose` | Fingerprint + Vina score per pose |
+| Pose-aware GNN | `gnn_pose` | Molecular graph + Vina score per pose |
+| DimeNet++ with protein features | `dimenet` | 3D ligand graph + protein contact scalars per pose |
+
+The `svr_fp_pose` and `gnn_pose` models are trained on **all** Vina poses (not
+just rank-1) and append the per-pose Vina score to the molecular representation.
+Predictions therefore differ between poses of the same ligand.
+
+The `dimenet` model uses a different mechanism: it passes the 3D ligand structure
+through a **DimeNet++** graph neural network (direction-aware message passing on
+3D atom coordinates), then concatenates 12 protein–ligand contact scalar features
+with the resulting embedding before the MLP head. Because contact features are
+computed per docking pose from the protein PDB + pose PDBQT coordinates,
+predictions are inherently pose-specific without adding an explicit Vina-score
+feature.
 
 ---
 
@@ -47,7 +68,7 @@ Required packages (all present in `docking_aitenea`):
 The prediction script loads pre-trained weights, so you must train the models
 first using the main pipeline.
 
-### SVR + fingerprints
+### SVR + fingerprints (`svr_fp`)
 
 ```bash
 python process_pdbind.py \
@@ -55,11 +76,11 @@ python process_pdbind.py \
   --affinity-compare-features
 ```
 
-This trains affinity models on both feature sets and saves:
+Saves:
 - `output/svr_affinity_fp_model.joblib` — trained SVR pipeline (StandardScaler → SVR)
 - `output/svr_affinity_fp_metadata.json` — fingerprint column names and bit count
 
-To use optimised hyperparameters (recommended):
+With optimised hyperparameters:
 
 ```bash
 python process_pdbind.py \
@@ -68,14 +89,26 @@ python process_pdbind.py \
   --load-hyperparams-fp output/best_hyperparams_fp.json
 ```
 
-### GNN
+### Pose-aware SVR (`svr_fp_pose`)
+
+```bash
+python process_pdbind.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --affinity-compare-features --pose-aware-affinity
+```
+
+Saves:
+- `output/svr_affinity_fp_pose_model.joblib` — pose-aware SVR pipeline
+- `output/svr_affinity_fp_pose_metadata.json` — fingerprint info + pose feature names
+
+### GNN (`gnn`)
 
 ```bash
 python gnn_affinity.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
 ```
 
-This saves `output/gnn_model.pt` (weights + hyperparameters).
+Saves `output/gnn_model.pt` (weights + hyperparameters).
 
 With optimised hyperparameters:
 
@@ -83,6 +116,66 @@ With optimised hyperparameters:
 python gnn_affinity.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
   --load-hyperparams output/gnn_best_hyperparams.json
+```
+
+### Pose-aware GNN (`gnn_pose`)
+
+```bash
+python gnn_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --pose-aware
+```
+
+Saves `output/gnn_pose_model.pt` (includes `pose_feature_cols` metadata).
+
+With optimised hyperparameters:
+
+```bash
+python gnn_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --pose-aware --load-hyperparams output/gnn_pose_best_hyperparams.json
+```
+
+### DimeNet++ with protein features (`dimenet`)
+
+**Prerequisite:** the training CSV must contain protein–ligand contact feature
+columns. These are added by running `process_pdbind.py` with `--augment` before
+training. The 12 contact columns are:
+`contact_n_3A`, `contact_n_4A`, `contact_n_5A`, `contact_min_dist`,
+`contact_score_lj`, `contact_buried_frac`, `contact_n_per_atom`,
+`contact_n_hydrophobic`, `contact_n_hbond`, `contact_n_aromatic`,
+`contact_score_gaussian`, `contact_hbond_normalized`.
+
+**Also requires:** `torch-cluster`, `torch-sparse`, and `torch-scatter`. Install
+them from the PyG wheels matching your PyTorch version (e.g. torch 2.10.0):
+
+```bash
+pip install torch-cluster torch-sparse torch-scatter \
+    --find-links https://data.pyg.org/whl/torch-2.10.0+cpu.html
+```
+
+```bash
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
+```
+
+Saves:
+- `output/dimenet_model.pt` — trained DimeNet++ weights + metadata
+
+With optimised hyperparameters:
+
+```bash
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --load-hyperparams output/dimenet_best_hyperparams.json
+```
+
+Without protein features (ligand-only DimeNet++):
+
+```bash
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --no-protein-features
 ```
 
 ---
@@ -138,36 +231,52 @@ Multiple ligands can share the same protein (docking against the same target).
 
 ## Step 3: Run Predictions
 
-### SVR + fingerprints (recommended for large sets, no GPU needed)
+### Per-ligand models (same ΔG for all poses of one ligand)
 
 ```bash
+# SVR + fingerprints (fast, CPU, no GPU needed)
 python predict_affinity.py \
     --manifest inputs/manifest.csv \
     --model svr_fp \
-    --svr-model output/svr_affinity_fp_model.joblib \
-    --svr-meta  output/svr_affinity_fp_metadata.json \
     --output predictions_svr.csv
-```
 
-### GNN
-
-```bash
+# GNN
 python predict_affinity.py \
     --manifest inputs/manifest.csv \
     --model gnn \
-    --gnn-model output/gnn_model.pt \
     --output predictions_gnn.csv
 ```
 
-Force a specific device for GNN:
+### Pose-aware models (different ΔG per pose)
 
 ```bash
+# Pose-aware SVR (fast, CPU)
 python predict_affinity.py \
     --manifest inputs/manifest.csv \
-    --model gnn \
-    --gnn-model output/gnn_model.pt \
-    --device cpu \
-    --output predictions_gnn.csv
+    --model svr_fp_pose \
+    --output predictions_svr_pose.csv
+
+# Pose-aware GNN
+python predict_affinity.py \
+    --manifest inputs/manifest.csv \
+    --model gnn_pose \
+    --output predictions_gnn_pose.csv
+
+# DimeNet++ with protein features (pose-aware by nature)
+python predict_affinity.py \
+    --manifest inputs/manifest.csv \
+    --model dimenet \
+    --output predictions_dimenet.csv
+```
+
+Model file paths default to the standard output directory names. Override with
+`--svr-model`, `--svr-meta`, or `--gnn-model` when using non-default paths.
+
+Force a specific device for GNN inference:
+
+```bash
+python predict_affinity.py --manifest inputs/manifest.csv --model gnn_pose \
+    --device cpu --output predictions_gnn_pose.csv
 ```
 
 ### All flags
@@ -175,10 +284,10 @@ python predict_affinity.py \
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest PATH` | required | Manifest CSV file |
-| `--model` | required | `svr_fp` or `gnn` |
-| `--svr-model PATH` | `output/svr_affinity_fp_model.joblib` | SVR joblib file (svr_fp only) |
-| `--svr-meta PATH` | `output/svr_affinity_fp_metadata.json` | SVR metadata JSON (svr_fp only) |
-| `--gnn-model PATH` | `output/gnn_model.pt` | GNN checkpoint (gnn only) |
+| `--model` | required | `svr_fp`, `gnn`, `svr_fp_pose`, `gnn_pose`, or `dimenet` |
+| `--svr-model PATH` | auto | SVR joblib file (auto-selected by model type) |
+| `--svr-meta PATH` | auto | SVR metadata JSON (auto-selected by model type) |
+| `--gnn-model PATH` | auto | GNN/DimeNet checkpoint (auto-selected by model type) |
 | `--device` | `auto` | GNN device: `auto`, `cuda`, `mps`, or `cpu` |
 | `--output PATH` | `predictions.csv` | Output CSV path |
 
@@ -207,10 +316,14 @@ lig2,1,-9.1,-8.41,svr_fp
 lig2,2,-8.8,-8.41,svr_fp
 ```
 
-**Note:** `predicted_affinity_kcal_mol` is the same for all poses of the same
-ligand — this is expected. The ML models predict affinity from molecular
-structure, not from pose geometry. Use the Vina score to distinguish poses
-within a ligand; use the ML prediction to compare ligands against each other.
+**For per-ligand models** (`svr_fp`, `gnn`): `predicted_affinity_kcal_mol` is the
+same for all poses of the same ligand. Use the Vina score to distinguish poses;
+use the ML prediction to compare ligands against each other.
+
+**For pose-aware models** (`svr_fp_pose`, `gnn_pose`): `predicted_affinity_kcal_mol`
+differs between poses of the same ligand because the Vina score is included as an
+input feature. Better-docked poses (lower Vina score) typically receive lower
+(more favorable) predicted ΔG values.
 
 **Typical range for drug-like binders:** −4 to −12 kcal/mol. More negative
 values indicate stronger predicted binding.
@@ -219,22 +332,54 @@ values indicate stronger predicted binding.
 
 ## Choosing a Model
 
+### Should I use per-ligand or pose-aware?
+
+Use **per-ligand** (`svr_fp`, `gnn`) when you want to compare ligands against each
+other and are not concerned with which pose of each ligand is most favorable.
+All poses of a ligand receive the same score, so you are effectively ranking
+ligands.
+
+Use **pose-aware** (`svr_fp_pose`, `gnn_pose`, `dimenet`) when you want to rank
+poses of the same ligand (e.g., to select the best docking pose for downstream
+analysis) or when you want a prediction that accounts for how well the ligand
+fits the binding site.
+
 ### SVR + fingerprints (`svr_fp`)
 
 - No GPU required; runs in seconds even for thousands of ligands
-- Uses 2048-bit Morgan ECFP4 fingerprints — captures local atomic environments
 - Good choice for lead optimisation where analogues share a scaffold
-- Requires `output/svr_affinity_fp_model.joblib` and `output/svr_affinity_fp_metadata.json`
+
+### Pose-aware SVR (`svr_fp_pose`)
+
+- Same speed as `svr_fp`; trained on all Vina poses with Vina score appended
+- Predictions differ per pose — the Vina score has a strong influence
+- Best when you want to both rank ligands and distinguish poses
 
 ### GNN (`gnn`)
 
 - Operates on the full molecular graph (all atoms + bond types)
 - May generalise better to novel scaffolds not seen during training
 - Benefits from GPU (MPS on Apple Silicon, CUDA on NVIDIA)
-- Requires `output/gnn_model.pt`
 
-When in doubt, run both and compare. Consistent predictions between models
-increase confidence.
+### Pose-aware GNN (`gnn_pose`)
+
+- Molecular graph + Vina score concatenated at the readout layer
+- Useful when scaffold diversity is high
+- Requires GPU for practical speed
+
+### DimeNet++ with protein features (`dimenet`)
+
+- Uses 3D atom coordinates from mol2 (direction-aware message passing)
+- Captures molecular geometry that 2D graph models cannot
+- Protein–ligand contact scalars provide binding-site context
+- Pose-specific by nature: contact features differ for each docked pose
+- Requires `torch-cluster`, `torch-sparse`, `torch-scatter` (see Step 1)
+- Best when 3D geometry and protein context are important
+- Requires training data with `--augment` contact features; falls back to
+  ligand-only mode if contact columns are absent
+
+When in doubt, run both `svr_fp_pose` and `dimenet` and compare. Consistent
+predictions between models increase confidence in the ranking.
 
 ---
 
@@ -264,3 +409,17 @@ conda activate docking_aitenea
 pip install torch torch-geometric
 ```
 Or use `--model svr_fp` if PyTorch is unavailable.
+
+**`ImportError: 'radius_graph' requires 'torch-cluster'`** (DimeNet++ only)
+DimeNet++ requires three extra PyG extensions. Install the wheels matching your
+PyTorch version:
+```bash
+pip install torch-cluster torch-sparse torch-scatter \
+    --find-links https://data.pyg.org/whl/torch-2.10.0+cpu.html
+```
+Replace `2.10.0` with your actual PyTorch version (`python -c "import torch; print(torch.__version__)"`).
+
+**`Warning: protein feature columns not in CSV` during DimeNet training**
+The training CSV does not contain contact feature columns. Re-run
+`process_pdbind.py` with `--augment` to compute them, or use
+`--no-protein-features` to train in ligand-only mode.

@@ -508,6 +508,7 @@ def run_vina(
     pdb_code: str,
     exhaustiveness: int = 8,
     vina_executable: Optional[Path] = None,
+    n_cpu: int = 0,
 ) -> Optional[Dict]:
     """
     Run AutoDock Vina on a single complex.
@@ -541,35 +542,37 @@ def run_vina(
         print(f"Warning: Could not define binding site for {pdb_code}: {e}")
         return None
     
-    # Create temporary files
+    # Create output file paths
     vina_input = OUTPUT_DIR / f"{pdb_code}_vina_input.pdbqt"
     vina_ligand = OUTPUT_DIR / f"{pdb_code}_vina_ligand.pdbqt"
     vina_output = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
-    
-    # Prepare receptor (convert PDB to PDBQT using Open Babel)
-    prepare_receptor = subprocess.run(
-        ['obabel', '-ipdb', str(protein_pdb), '-opdbqt', '-O', str(vina_input), 
-         '-xr', '--partialcharge', 'gasteiger'],
-        capture_output=True,
-        text=True
-    )
-    
-    if prepare_receptor.returncode != 0:
-        print(f"Warning: Failed to prepare receptor for {pdb_code}: {prepare_receptor.stderr}")
-        return None
-    
-    # Prepare ligand (convert MOL2 to PDBQT using Open Babel)
-    prepare_ligand = subprocess.run(
-        ['obabel', '-imol2', str(ligand_mol2), '-opdbqt', '-O', str(vina_ligand),
-         '--partialcharge', 'gasteiger'],
-        capture_output=True,
-        text=True
-    )
-    
-    if prepare_ligand.returncode != 0:
-        print(f"Warning: Failed to prepare ligand for {pdb_code}: {prepare_ligand.stderr}")
-        return None
-    
+
+    # Prepare receptor (convert PDB to PDBQT using Open Babel).
+    # Skip if the file already exists and is non-empty (e.g. after a restart).
+    if not vina_input.exists() or vina_input.stat().st_size == 0:
+        prepare_receptor = subprocess.run(
+            ['obabel', '-ipdb', str(protein_pdb), '-opdbqt', '-O', str(vina_input),
+             '-xr', '--partialcharge', 'gasteiger'],
+            capture_output=True,
+            text=True,
+        )
+        if prepare_receptor.returncode != 0:
+            print(f"Warning: Failed to prepare receptor for {pdb_code}: {prepare_receptor.stderr}")
+            return None
+
+    # Prepare ligand (convert MOL2 to PDBQT using Open Babel).
+    # Skip if the file already exists and is non-empty.
+    if not vina_ligand.exists() or vina_ligand.stat().st_size == 0:
+        prepare_ligand = subprocess.run(
+            ['obabel', '-imol2', str(ligand_mol2), '-opdbqt', '-O', str(vina_ligand),
+             '--partialcharge', 'gasteiger'],
+            capture_output=True,
+            text=True,
+        )
+        if prepare_ligand.returncode != 0:
+            print(f"Warning: Failed to prepare ligand for {pdb_code}: {prepare_ligand.stderr}")
+            return None
+
     # Run Vina
     vina_cmd = [
         str(exe),
@@ -583,8 +586,10 @@ def run_vina(
         '--size_z', str(size[2]),
         '--out', str(vina_output),
         '--num_modes', str(NUM_TOP_POSES),
-        '--exhaustiveness', str(exhaustiveness)
+        '--exhaustiveness', str(exhaustiveness),
     ]
+    if n_cpu > 0:
+        vina_cmd += ['--cpu', str(n_cpu)]
     
     result = subprocess.run(vina_cmd, capture_output=True, text=True)
     
@@ -627,13 +632,20 @@ def _vina_worker(args: tuple) -> Optional[Dict]:
     """Top-level worker for parallel Vina docking (must be module-level for pickling).
 
     Args:
-        args: (pdb_code, affinity_nM, exhaustiveness, vina_executable)
+        args: (pdb_code, affinity_nM, exhaustiveness, vina_executable[, n_cpu])
+              5-element form (with n_cpu) used by vina_docking.py for HPC arrays;
+              4-element form retained for backward compatibility.
 
     Returns:
         Complete result dict (vina result + rmsds + affinity_nM), or None on failure.
     """
-    pdb_code, affinity_nM, exhaustiveness, vina_executable = args
-    vina_result = run_vina(pdb_code, exhaustiveness=exhaustiveness, vina_executable=vina_executable)
+    if len(args) == 5:
+        pdb_code, affinity_nM, exhaustiveness, vina_executable, n_cpu = args
+    else:
+        pdb_code, affinity_nM, exhaustiveness, vina_executable = args
+        n_cpu = 0
+    vina_result = run_vina(pdb_code, exhaustiveness=exhaustiveness,
+                           vina_executable=vina_executable, n_cpu=n_cpu)
     if vina_result is None:
         return None
     rmsds = calculate_all_pose_rmsds(vina_result, pdb_code)
@@ -2213,29 +2225,48 @@ def evaluate_ensemble(model_results: Dict, test_df: pd.DataFrame) -> Dict:
     return result
 
 
-def prepare_affinity_data(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+def prepare_affinity_data(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    use_all_poses: bool = False,
+) -> pd.DataFrame:
     """
-    Build the per-complex affinity regression dataset from the rank-1 Vina pose.
+    Build the affinity regression dataset from Vina poses.
 
     Args:
-        df:           Per-pose DataFrame with affinity columns from join_affinity_labels().
-        feature_cols: Feature column names (same set used by the pose rankers).
+        df:            Per-pose DataFrame with affinity columns from join_affinity_labels().
+        feature_cols:  Feature column names (same set used by the pose rankers).
+        use_all_poses: If False (default), keep only the rank-1 pose per complex (one row per
+                       complex). If True, keep ALL poses; each row carries the same experimental
+                       ΔG label as its complex. Use with pose-aware models that can leverage
+                       pose-specific features (e.g. vina_score) to distinguish between poses.
 
     Returns:
-        Per-complex DataFrame (one row per complex) with feature_cols plus
-        pdb_code, exp_affinity_pKd, exp_affinity_kcal_mol, vina_score, rmsd, is_best_pose.
+        DataFrame with feature_cols plus metadata columns. One row per complex when
+        use_all_poses=False; one row per (complex, pose) when use_all_poses=True.
     """
-    rank1_df = df[df['vina_rank'] == 1].copy()
-    rank1_df = rank1_df.drop_duplicates(subset='pdb_code', keep='first')
+    if use_all_poses:
+        rank1_df = df.copy()
+    else:
+        rank1_df = df[df['vina_rank'] == 1].copy()
+        rank1_df = rank1_df.drop_duplicates(subset='pdb_code', keep='first')
 
     before = rank1_df['pdb_code'].nunique()
     rank1_df = rank1_df.dropna(subset=['exp_affinity_kcal_mol'])
     after = rank1_df['pdb_code'].nunique()
-    print(f"  Affinity dataset: {after} complexes with labels "
-          f"(dropped {before - after} without experimental affinity)")
+
+    if use_all_poses:
+        print(f"  Affinity dataset (all poses): {len(rank1_df)} rows from {after} complexes "
+              f"(dropped {before - after} complexes without experimental affinity)")
+    else:
+        print(f"  Affinity dataset: {after} complexes with labels "
+              f"(dropped {before - after} without experimental affinity)")
 
     meta_cols = ['pdb_code', 'exp_affinity_pKd', 'exp_affinity_kcal_mol',
                  'vina_score', 'rmsd', 'is_best_pose']
+    if use_all_poses and 'pose_idx' in df.columns:
+        meta_cols = ['pdb_code', 'pose_idx', 'exp_affinity_pKd', 'exp_affinity_kcal_mol',
+                     'vina_score', 'rmsd', 'is_best_pose']
     feat_present = [c for c in feature_cols if c in rank1_df.columns]
     keep_cols = meta_cols + [c for c in feat_present if c not in meta_cols]
     return rank1_df[keep_cols].reset_index(drop=True)
@@ -2336,6 +2367,77 @@ def train_affinity_model(
         'ridge_affinity': (ridge_pipe, available_cols),
         'mlp_affinity':   (mlp_pipe,   available_cols),
     }
+
+
+_DEFAULT_POSE_FEATURES = ['vina_score']
+
+
+def train_pose_aware_svr_fp(
+    train_df: pd.DataFrame,
+    fp_n_bits: int = 2048,
+    pose_feature_cols: Optional[List[str]] = None,
+    hyperparams: Optional[Dict] = None,
+) -> Tuple[Pipeline, List[str]]:
+    """
+    Train a pose-aware SVR using Morgan fingerprints concatenated with pose-specific scalars.
+
+    Unlike the per-ligand SVR+fp model, this variant trains on ALL docking poses (each
+    labeled with its complex's experimental ΔG) and appends pose-specific features
+    (e.g. vina_score) to the fingerprint vector. The model can then produce different
+    predicted ΔG values for different poses of the same ligand.
+
+    Args:
+        train_df:          All-pose affinity DataFrame from prepare_affinity_data(use_all_poses=True).
+        fp_n_bits:         Morgan fingerprint bit count (default 2048).
+        pose_feature_cols: Column names to append after the fingerprint (default: ['vina_score']).
+        hyperparams:       Optional SVR hyperparameters (C, epsilon, gamma).
+
+    Returns:
+        (fitted_pipeline, combined_feature_col_names)
+    """
+    if pose_feature_cols is None:
+        pose_feature_cols = _DEFAULT_POSE_FEATURES
+
+    # Cache fingerprints per pdb_code — all poses of a ligand share the same mol2 file
+    fp_cache: Dict[str, Optional[np.ndarray]] = {}
+    for pdb_code in train_df['pdb_code'].unique():
+        mol2 = STRUCTURES_DIR / pdb_code / f"{pdb_code}_ligand.mol2"
+        fp_cache[pdb_code] = compute_morgan_fingerprint(mol2, fp_n_bits)
+
+    fp_cols = [f'morgan_fp_{i}' for i in range(fp_n_bits)]
+    available_pose_cols = [c for c in pose_feature_cols if c in train_df.columns]
+    combined_cols = fp_cols + available_pose_cols
+
+    X_rows: List[np.ndarray] = []
+    y_rows: List[float] = []
+    for row in train_df.itertuples(index=False):
+        fp = fp_cache.get(row.pdb_code)
+        if fp is None:
+            continue
+        pose_vals = np.array(
+            [float(getattr(row, c, 0.0)) for c in available_pose_cols], dtype=np.float32
+        )
+        X_rows.append(np.concatenate([fp, pose_vals]))
+        y_rows.append(float(row.exp_affinity_kcal_mol))
+
+    if not X_rows:
+        raise ValueError("No valid training rows: no mol2 files could be parsed.")
+
+    X = np.nan_to_num(np.array(X_rows, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    y = np.array(y_rows, dtype=np.float32)
+
+    svr_params = {'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale', **(hyperparams or {})}
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('svr', SVR(kernel='rbf', **svr_params)),
+    ])
+    pipeline.fit(X, y)
+
+    n_ligands = sum(1 for fp in fp_cache.values() if fp is not None)
+    print(f"  Pose-aware SVR+fp: {len(X_rows)} pose rows from {n_ligands} ligands, "
+          f"{len(combined_cols)} features "
+          f"(fp={fp_n_bits} + pose={available_pose_cols})")
+    return pipeline, combined_cols
 
 
 def evaluate_affinity_model(
@@ -3279,6 +3381,14 @@ def main():
         help='Compare affinity models trained on current features vs Morgan fingerprints only. '
              'Generates separate plots and a side-by-side summary table.'
     )
+    parser.add_argument(
+        '--pose-aware-affinity',
+        action='store_true',
+        help='Train a pose-aware SVR+fingerprints model that concatenates Morgan fingerprints '
+             'with per-pose Vina score, enabling different ΔG predictions for different poses '
+             'of the same ligand. Saves output/svr_affinity_fp_pose_model.joblib. '
+             'Requires --affinity-compare-features (needs fingerprint infrastructure).'
+    )
     _ALL_OPT_MODELS = [
         'rf_ranker', 'gb_ranker', 'xgb_ranker',
         'rf_affinity', 'gb_affinity', 'svr_affinity', 'xgb_affinity', 'ridge_affinity', 'mlp_affinity',
@@ -3949,6 +4059,36 @@ def main():
                                 fp_affinity_metrics_val,  OUTPUT_DIR, split='fingerprints_val')
                         except Exception as e:
                             print(f"Warning: Could not generate fingerprint affinity plot: {e}")
+
+                    # ---- Pose-aware SVR+fp ----
+                    if args.pose_aware_affinity:
+                        print("\n" + "=" * 60)
+                        print("POSE-AWARE SVR+FINGERPRINTS MODEL")
+                        print("=" * 60)
+                        print("Preparing all-pose affinity datasets...")
+                        train_aff_all = prepare_affinity_data(
+                            train_df_aff, feature_cols_aff, use_all_poses=True)
+                        if len(train_aff_all) < 10:
+                            print("  Warning: too few pose rows. Skipping pose-aware SVR.")
+                        else:
+                            pose_feature_cols_pa = ['vina_score']
+                            print(f"Training pose-aware SVR+fp "
+                                  f"(fingerprints + {pose_feature_cols_pa})...")
+                            svr_pose_pipe, svr_pose_cols = train_pose_aware_svr_fp(
+                                train_aff_all,
+                                pose_feature_cols=pose_feature_cols_pa,
+                                hyperparams=svr_affinity_hp_fp or None,
+                            )
+                            svr_pose_path = OUTPUT_DIR / 'svr_affinity_fp_pose_model.joblib'
+                            joblib.dump(svr_pose_pipe, svr_pose_path)
+                            svr_pose_meta = {
+                                'fp_n_bits': 2048,
+                                'pose_feature_cols': pose_feature_cols_pa,
+                                'combined_feature_cols': svr_pose_cols,
+                            }
+                            (OUTPUT_DIR / 'svr_affinity_fp_pose_metadata.json').write_text(
+                                json.dumps(svr_pose_meta, indent=2))
+                            print(f"Saved pose-aware SVR+fp model to {svr_pose_path}")
     else:
         print("\nSkipping affinity prediction (--no-affinity set).")
 

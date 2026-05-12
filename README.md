@@ -29,7 +29,9 @@ activated environment.
 | Script | Purpose |
 |---|---|
 | `process_pdbind.py` | Full pipeline: Vina docking → feature extraction → ML pose ranking + affinity prediction |
-| `gnn_affinity.py` | GNN-based binding affinity prediction (PyTorch Geometric) |
+| `vina_docking.py` | Standalone Vina docking step for HPC SLURM job arrays (parallelised, restartable) |
+| `gnn_affinity.py` | GINEConv-based GNN for binding affinity prediction (PyTorch Geometric) |
+| `gnn_dimenet_affinity.py` | DimeNet++ GNN with protein feature augmentation for binding affinity prediction |
 | `predict_affinity.py` | Standalone inference: predict ΔG for new ligands from pre-trained models |
 
 ---
@@ -225,6 +227,8 @@ python process_pdbind.py \
 | `output/best_hyperparams_fp.json` | Best hyperparameters (fingerprints; with `--affinity-compare-features`) |
 | `output/svr_affinity_fp_model.joblib` | Trained SVR+fingerprints pipeline (with `--affinity-compare-features`) |
 | `output/svr_affinity_fp_metadata.json` | Fingerprint column names and bit count for the SVR model |
+| `output/svr_affinity_fp_pose_model.joblib` | Pose-aware SVR (with `--affinity-compare-features --pose-aware-affinity`) |
+| `output/svr_affinity_fp_pose_metadata.json` | Fingerprint + pose feature metadata for the pose-aware SVR |
 | `output/pose_selection_metrics.txt` | Pose ranking metrics for all models |
 | `output/score_comparison.csv` | Per-pose scores from all rankers |
 | `output/affinity_predictions.csv` | Per-complex predicted vs experimental ΔG |
@@ -321,25 +325,36 @@ Ligand mol2 file
 
 | File | Description |
 |---|---|
-| `output/gnn_model.pt` | Saved model weights + hyperparameters |
-| `output/gnn_best_hyperparams.json` | Best Optuna hyperparameters |
+| `output/gnn_model.pt` | GINEConv GNN weights + hyperparameters |
+| `output/gnn_pose_model.pt` | Pose-aware GINEConv GNN weights (with `--pose-aware`) |
+| `output/gnn_best_hyperparams.json` | Best Optuna hyperparameters for GINEConv GNN |
+| `output/gnn_pose_best_hyperparams.json` | Best Optuna hyperparameters for pose-aware GNN |
 | `output/gnn_affinity_predictions.csv` | Per-complex predicted vs experimental ΔG (test set) |
 | `output/gnn_affinity_predictions_test.png` | Scatter plot — test set |
 | `output/gnn_affinity_predictions_val.png` | Scatter plot — validation set |
 | `output/gnn_optuna_trials.png` | Optuna CV MSE vs trial number |
+| `output/dimenet_model.pt` | DimeNet++ weights + hyperparameters + protein feature metadata |
+| `output/dimenet_best_hyperparams.json` | Best Optuna hyperparameters for DimeNet++ |
+| `output/dimenet_affinity_predictions.csv` | Per-complex DimeNet++ predicted vs experimental ΔG |
+| `output/dimenet_affinity_predictions_test.png` | DimeNet++ scatter plot — test set |
+| `output/dimenet_affinity_predictions_val.png` | DimeNet++ scatter plot — validation set |
+| `output/dimenet_optuna_trials.png` | DimeNet++ Optuna CV MSE vs trial number |
 
 ---
 
 ## predict_affinity.py
 
-Standalone inference script for integrating the best trained models into a drug
-discovery workflow. Given Vina-docked poses for one or more novel ligands,
-predicts binding affinity (ΔG, kcal/mol) using either the SVR+fingerprints or
-GNN model. No retraining or PDBbind data required at inference time.
+Standalone inference script for integrating trained models into a drug discovery
+workflow. Given Vina-docked poses for one or more novel ligands, predicts binding
+affinity (ΔG, kcal/mol). No retraining or PDBbind data required at inference time.
 
-Both models are per-ligand (they use molecular structure, not pose coordinates),
-so all poses of the same ligand receive the same predicted ΔG. Output is
-formatted per-pose for easy downstream use.
+Five models are supported:
+- **`svr_fp`** / **`gnn`** — per-ligand: all poses of the same ligand receive the
+  same predicted ΔG (models use molecular structure only).
+- **`svr_fp_pose`** / **`gnn_pose`** — pose-aware: trained on all Vina poses with
+  the Vina score as an additional feature; predictions differ per pose.
+- **`dimenet`** — DimeNet++ GNN with protein augmentation: uses 3D atom coordinates
+  and 12 protein–ligand contact scalar features; inherently pose-aware.
 
 > See **[PREDICT_AFFINITY_GUIDE.md](PREDICT_AFFINITY_GUIDE.md)** for full
 > instructions: prerequisites, input formats, and troubleshooting.
@@ -347,31 +362,39 @@ formatted per-pose for easy downstream use.
 ### Quick start
 
 ```bash
-# 1. Train and save models (only needed once after training)
+# 1. Train and save models (only needed once)
 python process_pdbind.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --affinity-compare-features        # saves svr_affinity_fp_model.joblib
+  --affinity-compare-features              # saves svr_affinity_fp_model.joblib
+
+python process_pdbind.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --affinity-compare-features --pose-aware-affinity   # saves svr_affinity_fp_pose_model.joblib
 
 python gnn_affinity.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
   # saves gnn_model.pt
 
+python gnn_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
+  --pose-aware                              # saves gnn_pose_model.pt
+
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
+  # saves dimenet_model.pt (requires contact features from --augment)
+
 # 2. Create a manifest CSV (one row per ligand)
 # ligand_id,ligand_mol2,protein_pdb,vina_pdbqt
 # lig1,inputs/lig1.mol2,inputs/protein.pdb,inputs/lig1_poses.pdbqt
-# ...
 
-# 3. Predict with SVR+fingerprints (fast, CPU)
-python predict_affinity.py \
-    --manifest inputs/manifest.csv \
-    --model svr_fp \
-    --output predictions.csv
+# 3. Per-ligand prediction (same ΔG for all poses of a ligand)
+python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp --output predictions.csv
+python predict_affinity.py --manifest inputs/manifest.csv --model gnn    --output predictions.csv
 
-# 4. Or predict with GNN
-python predict_affinity.py \
-    --manifest inputs/manifest.csv \
-    --model gnn \
-    --output predictions.csv
+# 4. Pose-aware prediction (different ΔG per pose)
+python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp_pose --output predictions.csv
+python predict_affinity.py --manifest inputs/manifest.csv --model gnn_pose    --output predictions.csv
+python predict_affinity.py --manifest inputs/manifest.csv --model dimenet     --output predictions.csv
 ```
 
 ### All flags
@@ -379,10 +402,10 @@ python predict_affinity.py \
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest PATH` | required | Manifest CSV: `ligand_id`, `ligand_mol2`, `protein_pdb`, `vina_pdbqt` |
-| `--model` | required | `svr_fp` (SVR+fingerprints) or `gnn` (Graph Neural Network) |
-| `--svr-model PATH` | `output/svr_affinity_fp_model.joblib` | Saved SVR pipeline |
-| `--svr-meta PATH` | `output/svr_affinity_fp_metadata.json` | SVR fingerprint metadata |
-| `--gnn-model PATH` | `output/gnn_model.pt` | Saved GNN checkpoint |
+| `--model` | required | `svr_fp`, `gnn` (per-ligand) or `svr_fp_pose`, `gnn_pose`, `dimenet` (pose-aware) |
+| `--svr-model PATH` | auto | SVR joblib file (auto-resolved by model type) |
+| `--svr-meta PATH` | auto | SVR metadata JSON (auto-resolved by model type) |
+| `--gnn-model PATH` | auto | GNN/DimeNet checkpoint (auto-resolved by model type) |
 | `--device` | `auto` | GNN device: `auto`, `cuda`, `mps`, or `cpu` |
 | `--output PATH` | `predictions.csv` | Output CSV |
 
@@ -395,8 +418,85 @@ One row per (ligand, pose):
 | `ligand_id` | From the manifest |
 | `pose_idx` | Vina pose number (1-based) |
 | `vina_score` | Vina score for this pose (kcal/mol) |
-| `predicted_affinity_kcal_mol` | ML-predicted ΔG (kcal/mol); same for all poses of one ligand |
-| `model` | `svr_fp` or `gnn` |
+| `predicted_affinity_kcal_mol` | ML-predicted ΔG (kcal/mol) |
+| `model` | Model identifier (e.g. `svr_fp`, `gnn`, `dimenet`) |
+
+---
+
+## vina_docking.py
+
+Standalone AutoDock Vina docking script designed for HPC SLURM job arrays.
+Separates the compute-intensive docking step from feature extraction and ML
+training, so large datasets can be parallelised across many nodes.
+
+**Key features:**
+- Each SLURM task processes a non-overlapping slice of complexes (`--start` / `--count`)
+- Runs `--cpus` Vina instances simultaneously; each Vina call uses exactly 1 CPU
+  (`--cpu 1` passed to Vina), so CPU allocation is predictable
+- Protein and ligand PDBQT files are written to the shared `output/` directory and
+  skipped on re-run if they already exist (safe restarts after node failures)
+- Each task writes `output/vina_batch_{start:06d}.csv`; batches are concatenated
+  after all tasks finish and fed to `process_pdbind.py --load-csv`
+
+### SLURM job array example
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=vina_array
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32GB
+#SBATCH --time=24:00:00
+#SBATCH --array=0-19
+#SBATCH --output=logs/vina_%A_%a.out
+
+module purge
+module load cesga/2020 python/3.10.8 autodock_vina/1.1.2_linux_x86
+source ~/vina_env/bin/activate
+
+cd $LUSTRE/vina_project
+mkdir -p logs output
+
+# Task 0 → complexes 0–999, Task 1 → 1000–1999, …
+STEP=1000
+START_IDX=$((SLURM_ARRAY_TASK_ID * STEP))
+
+python vina_docking.py \
+    --start $START_IDX \
+    --count $STEP \
+    --cpus $SLURM_CPUS_PER_TASK
+```
+
+### Post-processing (after all array tasks complete)
+
+```bash
+# Combine all batch CSVs into a single training file
+python - <<'EOF'
+import pandas as pd, glob
+dfs = [pd.read_csv(f) for f in sorted(glob.glob('output/vina_batch_*.csv'))]
+pd.concat(dfs, ignore_index=True).to_csv('output/training_data.csv', index=False)
+print(f"Combined {len(dfs)} batches → output/training_data.csv")
+EOF
+
+# Run CASF-2016 test set (optional, single job)
+python vina_docking.py --casf --cpus 8
+
+# Feature extraction + ML on the combined data
+python process_pdbind.py \
+    --load-csv output/training_data.csv output/casf_results.csv
+```
+
+### All flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--start N` | 0 | Start index into the sorted complex list |
+| `--count N` | 1000 | Number of complexes this task processes |
+| `--cpus N` | 8 | Parallel Vina workers; should match `--cpus-per-task` |
+| `--exhaustiveness N` | 8 | Vina exhaustiveness parameter |
+| `--vina-executable PATH` | VINA_EXECUTABLE | Override Vina binary location |
+| `--casf` | (flag) | Run CASF-2016 test set; output → `output/casf_results.csv` |
+| `--output-dir PATH` | `output/` | Shared output directory for PDBQT and result CSVs |
 
 ---
 

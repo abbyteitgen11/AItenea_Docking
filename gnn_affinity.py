@@ -187,22 +187,32 @@ def mol_to_graph(mol, y: float) -> Optional[Data]:
 
 class LigandDataset(InMemoryDataset):
     """
-    In-memory PyG dataset built from a per-complex affinity DataFrame.
+    In-memory PyG dataset built from a per-complex (or per-pose) affinity DataFrame.
 
-    Each entry corresponds to one complex; the graph is the ligand molecular graph
-    (from the mol2 crystal structure). Complexes whose mol2 files are missing or
-    unparseable are silently dropped.
+    Each entry is a ligand molecular graph from the mol2 crystal structure.
+    Entries whose mol2 files are missing or unparseable are silently dropped.
+
+    When pose_feature_cols is provided, each Data object carries a pose_feats tensor
+    of shape (1, n_pose_features) populated from the corresponding DataFrame columns.
+    This enables pose-aware GNN models that concatenate pose scalars (e.g. vina_score)
+    with the graph embedding before the MLP head.
 
     Attributes:
-        pdb_codes (List[str]): PDB codes of successfully parsed complexes.
-        y_true    (np.ndarray): Experimental ΔG values for successfully parsed complexes.
+        pdb_codes (List[str]): PDB codes of successfully parsed entries.
+        y_true    (np.ndarray): Experimental ΔG values for successfully parsed entries.
     """
 
-    def __init__(self, aff_df: pd.DataFrame):
+    def __init__(
+        self,
+        aff_df: pd.DataFrame,
+        pose_feature_cols: Optional[List[str]] = None,
+    ):
         super().__init__(root=None, transform=None, pre_transform=None)
         data_list = []
         pdb_codes = []
         y_values = []
+
+        _pose_cols = [c for c in (pose_feature_cols or []) if c in aff_df.columns]
 
         for row in aff_df.itertuples(index=False):
             mol2_path = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
@@ -211,6 +221,9 @@ class LigandDataset(InMemoryDataset):
                 mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)
             graph = mol_to_graph(mol, float(row.exp_affinity_kcal_mol))
             if graph is not None:
+                if _pose_cols:
+                    pose_vals = [float(getattr(row, c, 0.0)) for c in _pose_cols]
+                    graph.pose_feats = torch.tensor([pose_vals], dtype=torch.float)
                 data_list.append(graph)
                 pdb_codes.append(row.pdb_code)
                 y_values.append(float(row.exp_affinity_kcal_mol))
@@ -230,13 +243,15 @@ def build_datasets(
     train_aff: pd.DataFrame,
     val_aff: pd.DataFrame,
     test_aff: pd.DataFrame,
+    pose_feature_cols: Optional[List[str]] = None,
 ) -> Tuple['LigandDataset', 'LigandDataset', 'LigandDataset']:
     """Build train/val/test LigandDatasets from per-complex affinity DataFrames."""
     print("Building graph datasets...")
-    train_ds = LigandDataset(train_aff)
-    val_ds   = LigandDataset(val_aff)
-    test_ds  = LigandDataset(test_aff)
-    print(f"  Train: {len(train_ds)} / Val: {len(val_ds)} / Test: {len(test_ds)} complexes parsed")
+    train_ds = LigandDataset(train_aff, pose_feature_cols=pose_feature_cols)
+    val_ds   = LigandDataset(val_aff,   pose_feature_cols=pose_feature_cols)
+    test_ds  = LigandDataset(test_aff,  pose_feature_cols=pose_feature_cols)
+    label = "complexes" if pose_feature_cols is None else "pose rows"
+    print(f"  Train: {len(train_ds)} / Val: {len(val_ds)} / Test: {len(test_ds)} {label} parsed")
     dropped_train = len(train_aff) - len(train_ds)
     dropped_val   = len(val_aff)   - len(val_ds)
     dropped_test  = len(test_aff)  - len(test_ds)
@@ -269,8 +284,10 @@ class AffinityGNN(nn.Module):
         hidden_dim: int = 128,
         n_layers: int = 3,
         dropout: float = 0.1,
+        n_pose_features: int = 0,
     ):
         super().__init__()
+        self.n_pose_features = n_pose_features
         self.node_proj = nn.Linear(node_dim, hidden_dim)
         self.edge_proj = nn.Linear(edge_dim, hidden_dim)
 
@@ -285,8 +302,9 @@ class AffinityGNN(nn.Module):
             self.convs.append(GINEConv(mlp, train_eps=True))
             self.bns.append(BatchNorm(hidden_dim))
 
+        head_in = 2 * hidden_dim + n_pose_features
         self.head = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, 1),
@@ -305,6 +323,9 @@ class AffinityGNN(nn.Module):
         x_mean = global_mean_pool(x, data.batch)
         x_max  = global_max_pool(x, data.batch)
         x_pool = torch.cat([x_mean, x_max], dim=-1)
+
+        if self.n_pose_features > 0 and hasattr(data, 'pose_feats') and data.pose_feats is not None:
+            x_pool = torch.cat([x_pool, data.pose_feats], dim=-1)
 
         return self.head(x_pool).squeeze(-1)
 
@@ -395,15 +416,16 @@ def train_gnn(
     epochs: int,
     patience: int,
     device: torch.device,
+    n_pose_features: int = 0,
 ) -> Tuple[AffinityGNN, Dict]:
     """
     Train the GNN with early stopping on val MSE.
 
     Args:
-        train_ds:    Training LigandDataset.
-        val_ds:      Validation LigandDataset.
-        hyperparams: Dict with keys hidden_dim, n_layers, dropout, lr, batch_size.
-        epochs:      Maximum number of training epochs.
+        train_ds:         Training LigandDataset.
+        val_ds:           Validation LigandDataset.
+        hyperparams:      Dict with keys hidden_dim, n_layers, dropout, lr, batch_size.
+        epochs:           Maximum number of training epochs.
         patience:    Early stopping patience (epochs without val improvement).
         device:      Torch device.
 
@@ -420,6 +442,7 @@ def train_gnn(
     model = AffinityGNN(
         node_dim=NODE_DIM, edge_dim=EDGE_DIM,
         hidden_dim=hidden_dim, n_layers=n_layers, dropout=dropout,
+        n_pose_features=n_pose_features,
     ).to(device)
 
     train_loader = make_loader(train_ds, batch_size=batch_size, shuffle=True,  device=device)
@@ -481,6 +504,8 @@ def optimize_gnn_hyperparams(
     study_name: str = 'gnn_affinity',
     device: Optional[torch.device] = None,
     output_dir: Optional[Path] = None,
+    pose_feature_cols: Optional[List[str]] = None,
+    n_pose_features: int = 0,
 ) -> Dict:
     """
     Optuna search for GNN hyperparameters using 3-fold KFold CV on train+val combined.
@@ -494,7 +519,7 @@ def optimize_gnn_hyperparams(
     combined_df = pd.concat([train_aff_df, val_aff_df], ignore_index=True)
     # Build full dataset once (expensive mol2 parsing)
     print(f"  Building combined dataset for Optuna ({len(combined_df)} complexes)...")
-    combined_ds = LigandDataset(combined_df)
+    combined_ds = LigandDataset(combined_df, pose_feature_cols=pose_feature_cols)
     n = len(combined_ds)
     print(f"  {n} complexes parsed. Running {n_trials} Optuna trials × 3-fold CV...")
 
@@ -519,6 +544,7 @@ def optimize_gnn_hyperparams(
             fold_model = AffinityGNN(
                 node_dim=NODE_DIM, edge_dim=EDGE_DIM,
                 hidden_dim=hp['hidden_dim'], n_layers=hp['n_layers'], dropout=hp['dropout'],
+                n_pose_features=n_pose_features,
             ).to(device)
             opt = torch.optim.Adam(fold_model.parameters(), lr=hp['lr'], weight_decay=1e-5)
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -721,6 +747,22 @@ def main() -> None:
         choices=['auto', 'cpu', 'cuda', 'mps'],
         help='Torch device: auto detects CUDA → MPS → CPU',
     )
+    parser.add_argument(
+        '--pose-aware',
+        action='store_true',
+        help='Train a pose-aware GNN that concatenates per-pose scalar features (e.g. Vina score) '
+             'with the graph embedding before the MLP head. Trains on all Vina poses rather than '
+             'rank-1 only, enabling different ΔG predictions per pose. '
+             'Saves output/gnn_pose_model.pt.',
+    )
+    parser.add_argument(
+        '--pose-feature-cols',
+        nargs='+',
+        default=['vina_score'],
+        metavar='COL',
+        help='Column names from the CSV to use as per-pose scalar features '
+             '(default: vina_score). Only used with --pose-aware.',
+    )
     args = parser.parse_args()
 
     # --- Device ---
@@ -761,10 +803,22 @@ def main() -> None:
                     'exp_affinity_pKd', 'exp_affinity_kcal_mol'}
     feature_cols_aff = [c for c in train_df.columns if c not in _aff_exclude]
 
-    print("\nPreparing per-complex affinity datasets (rank-1 pose)...")
-    train_aff = prepare_affinity_data(train_df_aff, feature_cols_aff)
-    val_aff   = prepare_affinity_data(val_df_aff,   feature_cols_aff)
-    test_aff  = prepare_affinity_data(test_df_aff,  feature_cols_aff)
+    # Pose-aware mode: train on all poses, add pose scalars to the graph embedding
+    pose_feature_cols: Optional[List[str]] = None
+    n_pose_features: int = 0
+    if args.pose_aware:
+        pose_feature_cols = args.pose_feature_cols
+        n_pose_features   = len(pose_feature_cols)
+        print(f"\nPose-aware mode: using all poses + {pose_feature_cols} as pose features")
+        print("Preparing all-pose affinity datasets...")
+        train_aff = prepare_affinity_data(train_df_aff, feature_cols_aff, use_all_poses=True)
+        val_aff   = prepare_affinity_data(val_df_aff,   feature_cols_aff, use_all_poses=True)
+        test_aff  = prepare_affinity_data(test_df_aff,  feature_cols_aff, use_all_poses=True)
+    else:
+        print("\nPreparing per-complex affinity datasets (rank-1 pose)...")
+        train_aff = prepare_affinity_data(train_df_aff, feature_cols_aff)
+        val_aff   = prepare_affinity_data(val_df_aff,   feature_cols_aff)
+        test_aff  = prepare_affinity_data(test_df_aff,  feature_cols_aff)
 
     if len(train_aff) < 10 or len(test_aff) < 2:
         print("Error: too few complexes with affinity labels. Exiting.")
@@ -772,7 +826,8 @@ def main() -> None:
 
     # --- Build graph datasets ---
     print()
-    train_ds, val_ds, test_ds = build_datasets(train_aff, val_aff, test_aff)
+    train_ds, val_ds, test_ds = build_datasets(
+        train_aff, val_aff, test_aff, pose_feature_cols=pose_feature_cols)
 
     if len(train_ds) < 10:
         print("Error: too few training graphs parsed. Check mol2 file paths.")
@@ -788,6 +843,7 @@ def main() -> None:
             hyperparams = json.loads(hp_path.read_text())
             print(f"Loaded hyperparameters from {hp_path}: {hyperparams}")
 
+    study_name = 'gnn_pose_affinity' if args.pose_aware else 'gnn_affinity'
     if args.optimize_hyperparams:
         print(f"\nOptimising GNN hyperparameters "
               f"(Optuna, {args.n_trials} trials × 3-fold CV, max 50 epochs/fold)...")
@@ -795,11 +851,14 @@ def main() -> None:
             train_aff, val_aff,
             n_trials=args.n_trials,
             storage=optuna_storage,
-            study_name='gnn_affinity',
+            study_name=study_name,
             device=device,
             output_dir=OUTPUT_DIR if not args.no_plots else None,
+            pose_feature_cols=pose_feature_cols,
+            n_pose_features=n_pose_features,
         )
-        hp_save = OUTPUT_DIR / 'gnn_best_hyperparams.json'
+        hp_key = 'gnn_pose_best_hyperparams.json' if args.pose_aware else 'gnn_best_hyperparams.json'
+        hp_save = OUTPUT_DIR / hp_key
         hp_save.write_text(json.dumps(hyperparams, indent=2))
         print(f"Saved GNN hyperparameters to {hp_save}")
 
@@ -810,6 +869,7 @@ def main() -> None:
     model, val_metrics = train_gnn(
         train_ds, val_ds, hyperparams,
         epochs=args.epochs, patience=args.patience, device=device,
+        n_pose_features=n_pose_features,
     )
 
     # --- Evaluate on test set ---
@@ -836,12 +896,15 @@ def main() -> None:
     print(f"  MAE        : {test_metrics['mae']:.3f} kcal/mol")
 
     # --- Save model ---
-    model_path = OUTPUT_DIR / 'gnn_model.pt'
+    model_filename = 'gnn_pose_model.pt' if args.pose_aware else 'gnn_model.pt'
+    model_path = OUTPUT_DIR / model_filename
     torch.save({
-        'state_dict':  model.state_dict(),
-        'hyperparams': hyperparams,
-        'node_dim':    NODE_DIM,
-        'edge_dim':    EDGE_DIM,
+        'state_dict':        model.state_dict(),
+        'hyperparams':       hyperparams,
+        'node_dim':          NODE_DIM,
+        'edge_dim':          EDGE_DIM,
+        'n_pose_features':   n_pose_features,
+        'pose_feature_cols': pose_feature_cols or [],
     }, model_path)
     print(f"\nSaved model to {model_path}")
 

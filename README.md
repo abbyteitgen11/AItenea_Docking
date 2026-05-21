@@ -466,6 +466,7 @@ python vina_docking.py \
     --count $STEP \
     --cpus $SLURM_CPUS_PER_TASK
 ```
+to run: sbatch --array=0-19%10 submit_vina_array.sh (or something similar)
 
 ### Post-processing (after all array tasks complete)
 

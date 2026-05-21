@@ -483,6 +483,57 @@ def _vina_worker(args: tuple) -> Optional[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def _has_valid_output_pdbqt(pdb_code: str) -> bool:
+    """Return True if a complete Vina output PDBQT already exists for pdb_code."""
+    pdbqt = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
+    if not pdbqt.exists() or pdbqt.stat().st_size == 0:
+        return False
+    with open(pdbqt) as f:
+        return any(line.startswith('REMARK VINA RESULT:') for line in f)
+
+
+def _recover_worker(args: tuple) -> Optional[Dict]:
+    """
+    Reconstruct a result dict from an existing Vina output PDBQT (no Vina re-run).
+
+    args: (pdb_code, affinity_nM)
+    """
+    pdb_code, affinity_nM = args
+    vina_output = OUTPUT_DIR / f"{pdb_code}_vina_output.pdbqt"
+    scores: List[float] = []
+    try:
+        with open(vina_output) as f:
+            for line in f:
+                if line.startswith('REMARK VINA RESULT:'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        scores.append(float(parts[3]))
+    except (IOError, OSError):
+        return None
+    if not scores:
+        return None
+    pose_coords = extract_pose_coordinates(vina_output)
+    if len(pose_coords) != len(scores):
+        return None
+    vina_result: Dict = {
+        'pdb_code': pdb_code,
+        'scores': scores,
+        'pose_coordinates': pose_coords,
+        'top_score': scores[0],
+    }
+    rmsds = calculate_all_pose_rmsds(vina_result, pdb_code)
+    if rmsds is None:
+        print(f"  Could not calculate RMSDs for {pdb_code} (recovery), skipping")
+        return None
+    vina_result['rmsds'] = rmsds
+    vina_result['affinity_nM'] = affinity_nM
+    return vina_result
+
+
+# ---------------------------------------------------------------------------
 # Feature extraction and DataFrame assembly
 # ---------------------------------------------------------------------------
 
@@ -619,45 +670,99 @@ def main() -> None:
     end_idx = start + len(batch)
     print(f"This job: complexes [{start}:{end_idx}] ({len(batch)} complexes)")
 
-    worker_args = [
-        (pdb_code, affinity_nM, args.exhaustiveness, vina_exe, 1)
-        for pdb_code, affinity_nM in batch
-    ]
-
-    print(f"\nRunning Vina with {args.cpus} parallel workers "
-          f"(1 CPU per Vina instance)...")
-    t0 = time.time()
-
-    if args.cpus == 1:
-        raw_results = []
-        for i, wa in enumerate(worker_args, 1):
-            elapsed = time.time() - t0
-            rate = i / elapsed if elapsed > 0 else 0
-            remaining = (len(worker_args) - i) / rate if rate > 0 else 0
-            eta = f"{int(remaining // 60)}m {int(remaining % 60)}s" if rate > 0 else "--"
-            print(f"  [{i}/{len(worker_args)}] {wa[0]}  ETA: {eta}")
-            raw_results.append(_vina_worker(wa))
-    else:
-        with Pool(processes=args.cpus) as pool:
-            raw_results = pool.map(_vina_worker, worker_args)
-
-    elapsed = time.time() - t0
-    successes = [r for r in raw_results if r is not None]
-    n_failed = len(raw_results) - len(successes)
-    print(f"\nDocking complete in {elapsed:.1f}s: "
-          f"{len(successes)} succeeded, {n_failed} failed")
-
-    if not successes:
-        print("No successful docking results. Output CSV not written.")
-        sys.exit(1)
-
-    print("Converting results to DataFrame...")
-    results_df = prepare_training_data(successes)
-
+    # Determine output CSV path early — needed to check for existing work
     if args.casf:
         out_csv = out_dir / 'casf_results.csv'
     else:
         out_csv = out_dir / f'vina_batch_{start:06d}.csv'
+
+    # --- Resume: load existing CSV rows and categorize remaining work ---
+    existing_df = pd.DataFrame()
+    existing_codes: set = set()
+    if out_csv.exists():
+        try:
+            existing_df = pd.read_csv(out_csv)
+            existing_codes = set(existing_df['pdb_code'].unique())
+            print(f"  Resuming: found existing CSV with {len(existing_codes)} "
+                  f"completed complex(es) — skipping those.")
+        except Exception as exc:
+            print(f"  Warning: could not read existing CSV ({exc}), will reprocess all.")
+
+    to_run: List[Tuple[str, float]] = []      # no output PDBQT → run Vina
+    to_recover: List[Tuple[str, float]] = []  # PDBQT exists but not in CSV → recover
+    n_already_done = 0
+
+    for pdb_code, affinity_nM in batch:
+        if pdb_code in existing_codes:
+            n_already_done += 1
+        elif _has_valid_output_pdbqt(pdb_code):
+            to_recover.append((pdb_code, affinity_nM))
+        else:
+            to_run.append((pdb_code, affinity_nM))
+
+    print(f"  Already in CSV:        {n_already_done}")
+    print(f"  Recover from PDBQT:    {len(to_recover)}")
+    print(f"  Need Vina run:         {len(to_run)}")
+
+    if not to_run and not to_recover:
+        print("All complexes in this batch already processed. Nothing to do.")
+        sys.exit(0)
+
+    # --- Run Vina for new complexes ---
+    new_results: List[Optional[Dict]] = []
+    if to_run:
+        worker_args = [
+            (pdb_code, affinity_nM, args.exhaustiveness, vina_exe, 1)
+            for pdb_code, affinity_nM in to_run
+        ]
+        print(f"\nRunning Vina with {args.cpus} parallel workers "
+              f"({len(to_run)} complexes)...")
+        t0 = time.time()
+        if args.cpus == 1:
+            for i, wa in enumerate(worker_args, 1):
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed > 0 else 0
+                remaining = (len(worker_args) - i) / rate if rate > 0 else 0
+                eta = f"{int(remaining // 60)}m {int(remaining % 60)}s" if rate > 0 else "--"
+                print(f"  [{i}/{len(worker_args)}] {wa[0]}  ETA: {eta}")
+                new_results.append(_vina_worker(wa))
+        else:
+            with Pool(processes=args.cpus) as pool:
+                new_results = pool.map(_vina_worker, worker_args)
+        elapsed = time.time() - t0
+        n_success = sum(1 for r in new_results if r is not None)
+        n_failed  = len(new_results) - n_success
+        print(f"Vina complete in {elapsed:.1f}s: {n_success} succeeded, {n_failed} failed")
+
+    # --- Recover results from existing PDBQT files ---
+    recovered_results: List[Optional[Dict]] = []
+    if to_recover:
+        print(f"\nRecovering {len(to_recover)} complex(es) from existing PDBQT files...")
+        t1 = time.time()
+        if args.cpus == 1:
+            for item in to_recover:
+                recovered_results.append(_recover_worker(item))
+        else:
+            with Pool(processes=args.cpus) as pool:
+                recovered_results = pool.map(_recover_worker, to_recover)
+        n_rec = sum(1 for r in recovered_results if r is not None)
+        print(f"Recovery complete in {time.time() - t1:.1f}s: "
+              f"{n_rec}/{len(to_recover)} succeeded")
+
+    # --- Convert new + recovered results to DataFrame, merge with existing, write ---
+    all_new = [r for r in new_results + recovered_results if r is not None]
+    if not all_new and existing_df.empty:
+        print("No successful results and no existing data. Output CSV not written.")
+        sys.exit(1)
+
+    new_df = prepare_training_data(all_new) if all_new else pd.DataFrame()
+
+    if not existing_df.empty and not new_df.empty:
+        results_df = pd.concat([existing_df, new_df], ignore_index=True)
+    elif not existing_df.empty:
+        results_df = existing_df
+    else:
+        results_df = new_df
 
     results_df.to_csv(out_csv, index=False)
     n_poses = len(results_df)

@@ -12,6 +12,7 @@ plan.md
 checkpoints/
 output_remaining_complexes/
 remaining_complexes/
+.DS_Store
 *.log
 *.tar.gz
 *.gz

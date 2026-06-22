@@ -28,26 +28,14 @@ activated environment.
 
 | Script | Purpose |
 |---|---|
-| `process_pdbind.py` | Full pipeline: Vina docking → feature extraction → ML pose ranking + affinity prediction |
+| `process_pdbind.py` | Full pipeline: Vina docking → feature extraction → ML pose ranking + affinity prediction (incl. the pose-aware SVR+fingerprints model) |
 | `vina_docking.py` | Standalone Vina docking step for HPC SLURM job arrays (parallelised, restartable) |
+| `split_data.py` | Split the combined non-CASF pose pool into train/val (by complex, seed 42) with CASF-2016 as the fixed test set → `training_data.csv`, `val_data.csv`, `test_data.csv` |
+| `augment_csvs.py` | Add the 12 protein–ligand `contact_*` columns to the split CSVs (`*_aug.csv`), required as input for the DimeNet++ protein-feature model |
 | `gnn_affinity.py` | GINEConv-based GNN for binding affinity prediction (PyTorch Geometric) |
 | `gnn_dimenet_affinity.py` | DimeNet++ GNN with protein feature augmentation for binding affinity prediction |
-| `predict_affinity.py` | Standalone inference: predict ΔG for new ligands from pre-trained models |
+| `predict_affinity.py` | Standalone inference: predict ΔG for new ligands from saved checkpoints (`svr_fp_pose` and `dimenet`) |
 
----
-
-## Current Results
-
-| Task | Model | Metric | Value |
-|---|---|---|---|
-| Pose ranking | Vina (baseline) | Best-pose rate @ 2 Å | 28.2% |
-| Pose ranking | RF ranker (optimised) | Best-pose rate @ 2 Å | **33.7%** |
-| Pose ranking | Ensemble | Best-pose rate @ 2 Å | 33.0% |
-| Affinity prediction | Vina (baseline) | Pearson r | 0.215 |
-| Affinity prediction | GB regressor (optimised) | Pearson r | **0.649** |
-| Affinity prediction | RF regressor | Pearson r | 0.634 |
-
-Test set: CASF-2016 benchmark (285 complexes). Results above are from the previous refined-set run; will be updated after full PDBbind 2020 retraining.
 
 ---
 
@@ -99,7 +87,7 @@ python process_pdbind.py \
   --val-frac 0.1
 ```
 
-**Smoke-test with a small subset first:**
+**Test with a small subset first:**
 
 ```bash
 # Process 20 non-CASF complexes + all CASF — quick sanity check
@@ -175,6 +163,8 @@ python process_pdbind.py \
 | `--no-augment` | off | Skip mol2 descriptor and PDBQT geometry feature augmentation (faster but lower accuracy). |
 | `--no-contact-features` | off | Skip protein–ligand contact feature computation (KDTree-based). |
 | `--no-affinity` | off | Skip binding affinity prediction entirely. |
+| `--no-ranking` | off | Skip the pose-ranking models (xgb/rf/gb + ensemble) and go straight to the affinity section. Useful when only affinity models are wanted. |
+| `--pose-aware-affinity` | off | Also train + evaluate + save the pose-aware SVR+fingerprints model (`svr_affinity_fp_pose_model.joblib`). Requires `--affinity-compare-features`. |
 | `--optimize-hyperparams` | off | Run Optuna hyperparameter search for selected models. |
 | `--n-trials N` | `30` | Optuna trials per model. |
 | `--optuna-db PATH` | in-memory | SQLite file for persisting/resuming Optuna trials (e.g. `output/optuna_studies.db`). |
@@ -340,73 +330,98 @@ Ligand mol2 file
 | `output/dimenet_affinity_predictions_val.png` | DimeNet++ scatter plot — validation set |
 | `output/dimenet_optuna_trials.png` | DimeNet++ Optuna CV MSE vs trial number |
 
+(The `output/dimenet_*` files above are produced by `gnn_dimenet_affinity.py`, below.)
+
+---
+
+## gnn_dimenet_affinity.py
+
+DimeNet++ binding-affinity model (PyTorch Geometric). Runs the 3D ligand structure
+(from mol2) through a DimeNet++ network and concatenates 12 protein–ligand `contact_*`
+scalars before the MLP head, so predictions are pose-specific.
+
+- **Input must be the augmented CSVs** (`*_aug.csv` from `augment_csvs.py`) — the
+  `contact_*` columns must be present, otherwise it warns and silently falls back to
+  ligand-only mode. Affinity labels and 3D coordinates are read from the index/mol2 at
+  load time.
+- `main()` always trains and saves the **final** model after the (optional) Optuna
+  search, so a single `--optimize-hyperparams` run yields the ready-to-use
+  `output/dimenet_model.pt` checkpoint.
+- Requires a working `torch-cluster` (for `radius_graph`); **Apple MPS is not
+  supported** — use `--device cpu` or `--device cuda`.
+
+```bash
+# Optimise + train + evaluate + save (GPU recommended)
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data_aug.csv output/test_data_aug.csv output/val_data_aug.csv \
+  --optimize-hyperparams --n-trials 30 --device cuda
+
+# Ligand-only mode (no protein features)
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data_aug.csv output/test_data_aug.csv output/val_data_aug.csv \
+  --no-protein-features
+```
+
+Key flags: `--optimize-hyperparams`, `--n-trials N`, `--load-hyperparams JSON`,
+`--epochs N` (default 200), `--patience N` (default 20), `--no-protein-features`,
+`--device {auto,cpu,cuda,mps}`, `--optuna-db PATH` (omit on Lustre filesystems).
+
 ---
 
 ## predict_affinity.py
 
-Standalone inference script for integrating trained models into a drug discovery
+Standalone **inference** script for integrating trained models into a drug discovery
 workflow. Given Vina-docked poses for one or more novel ligands, predicts binding
-affinity (ΔG, kcal/mol). No retraining or PDBbind data required at inference time.
+affinity (ΔG, kcal/mol). It does **not** train anything — you supply a final
+checkpoint. No PDBbind data required at inference time.
 
-Five models are supported:
-- **`svr_fp`** / **`gnn`** — per-ligand: all poses of the same ligand receive the
-  same predicted ΔG (models use molecular structure only).
-- **`svr_fp_pose`** / **`gnn_pose`** — pose-aware: trained on all Vina poses with
-  the Vina score as an additional feature; predictions differ per pose.
-- **`dimenet`** — DimeNet++ GNN with protein augmentation: uses 3D atom coordinates
-  and 12 protein–ligand contact scalar features; inherently pose-aware.
+Two **pose-aware** models are supported (each pose gets its own ΔG):
+- **`svr_fp_pose`** — SVR + Morgan fingerprints with the per-pose Vina score appended.
+  Checkpoint: `svr_affinity_fp_pose_model.joblib` **and** `svr_affinity_fp_pose_metadata.json`.
+- **`dimenet`** — DimeNet++ GNN using 3D ligand coordinates + 12 protein–ligand contact
+  scalars. The contact features are computed **inside** `predict_affinity.py` per pose
+  from the protein PDB + that pose's PDBQT — no separate augmentation step at inference.
+  Checkpoint: `dimenet_model.pt`.
+
+These checkpoints are the **final trained models** saved by the training/optimization
+runs (the SVR by `process_pdbind.py --pose-aware-affinity`; DimeNet by
+`gnn_dimenet_affinity.py`, which always trains+saves after its Optuna search).
 
 > See **[PREDICT_AFFINITY_GUIDE.md](PREDICT_AFFINITY_GUIDE.md)** for full
 > instructions: prerequisites, input formats, and troubleshooting.
 
 ### Quick start
 
+A ready-to-run example ships with the repo: `example_manifest.csv` plus the
+`example_output/` directory holding three ligands' mol2/pdb/pdbqt files (with 5, 5, and
+1 poses — the pose count per ligand can vary).
+
 ```bash
-# 1. Train and save models (only needed once)
-python process_pdbind.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --affinity-compare-features              # saves svr_affinity_fp_model.joblib
+# Pose-aware SVR + fingerprints (CPU; needs BOTH the .joblib and .json)
+python predict_affinity.py --manifest example_manifest.csv --model svr_fp_pose \
+  --svr-model checkpoints/svr_affinity_fp_pose_model.joblib \
+  --svr-meta  checkpoints/svr_affinity_fp_pose_metadata.json \
+  --output predictions_svr_pose.csv
 
-python process_pdbind.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --affinity-compare-features --pose-aware-affinity   # saves svr_affinity_fp_pose_model.joblib
-
-python gnn_affinity.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
-  # saves gnn_model.pt
-
-python gnn_affinity.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --pose-aware                              # saves gnn_pose_model.pt
-
-python gnn_dimenet_affinity.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
-  # saves dimenet_model.pt (requires contact features from --augment)
-
-# 2. Create a manifest CSV (one row per ligand)
-# ligand_id,ligand_mol2,protein_pdb,vina_pdbqt
-# lig1,inputs/lig1.mol2,inputs/protein.pdb,inputs/lig1_poses.pdbqt
-
-# 3. Per-ligand prediction (same ΔG for all poses of a ligand)
-python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp --output predictions.csv
-python predict_affinity.py --manifest inputs/manifest.csv --model gnn    --output predictions.csv
-
-# 4. Pose-aware prediction (different ΔG per pose)
-python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp_pose --output predictions.csv
-python predict_affinity.py --manifest inputs/manifest.csv --model gnn_pose    --output predictions.csv
-python predict_affinity.py --manifest inputs/manifest.csv --model dimenet     --output predictions.csv
+# DimeNet++ with protein features (use cpu or cuda — NOT mps)
+python predict_affinity.py --manifest example_manifest.csv --model dimenet \
+  --dimenet-model checkpoints/dimenet_model.pt --device cpu \
+  --output predictions_dimenet.csv
 ```
+
+The `--svr-model`/`--svr-meta`/`--dimenet-model` paths default to the `checkpoints/`
+names above, so you can omit them if your files are there with the standard names.
 
 ### All flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--manifest PATH` | required | Manifest CSV: `ligand_id`, `ligand_mol2`, `protein_pdb`, `vina_pdbqt` |
-| `--model` | required | `svr_fp`, `gnn` (per-ligand) or `svr_fp_pose`, `gnn_pose`, `dimenet` (pose-aware) |
-| `--svr-model PATH` | auto | SVR joblib file (auto-resolved by model type) |
-| `--svr-meta PATH` | auto | SVR metadata JSON (auto-resolved by model type) |
-| `--gnn-model PATH` | auto | GNN/DimeNet checkpoint (auto-resolved by model type) |
-| `--device` | `auto` | GNN device: `auto`, `cuda`, `mps`, or `cpu` |
+| `--manifest PATH` | required | Manifest CSV: `ligand_id`, `ligand_mol2`, `vina_pdbqt` (+ `protein_pdb` for `dimenet`) |
+| `--model` | required | `svr_fp_pose` or `dimenet` |
+| `--svr-model PATH` | `checkpoints/svr_affinity_fp_pose_model.joblib` | Pose-aware SVR joblib checkpoint |
+| `--svr-meta PATH` | `checkpoints/svr_affinity_fp_pose_metadata.json` | Pose-aware SVR metadata JSON |
+| `--dimenet-model PATH` | `checkpoints/dimenet_model.pt` | DimeNet++ `.pt` checkpoint |
+| `--device` | `auto` | DimeNet device: `auto`, `cuda`, `mps`*, or `cpu` (*MPS unsupported by DimeNet++) |
 | `--output PATH` | `predictions.csv` | Output CSV |
 
 ### Output
@@ -419,7 +434,7 @@ One row per (ligand, pose):
 | `pose_idx` | Vina pose number (1-based) |
 | `vina_score` | Vina score for this pose (kcal/mol) |
 | `predicted_affinity_kcal_mol` | ML-predicted ΔG (kcal/mol) |
-| `model` | Model identifier (e.g. `svr_fp`, `gnn`, `dimenet`) |
+| `model` | `svr_fp_pose` or `dimenet` |
 
 ---
 
@@ -505,8 +520,17 @@ python process_pdbind.py \
 
 ```
 AItenea_Docking/
-├── process_pdbind.py          # Main ML pipeline
-├── gnn_affinity.py            # GNN affinity model
+├── process_pdbind.py          # Main ML pipeline (ranking + affinity, incl. pose-aware SVR)
+├── vina_docking.py            # Standalone Vina docking for HPC SLURM arrays
+├── split_data.py              # Build train/val/test split (CASF = test)
+├── augment_csvs.py            # Add contact_* columns → *_aug.csv (for DimeNet)
+├── gnn_affinity.py            # GINEConv GNN affinity model
+├── gnn_dimenet_affinity.py    # DimeNet++ affinity model (protein features)
+├── predict_affinity.py        # Inference: svr_fp_pose + dimenet
+├── PREDICT_AFFINITY_GUIDE.md  # Full prediction guide
+├── example_manifest.csv       # Ready-to-run prediction example
+├── example_output/            # Input mol2/pdb/pdbqt for the example manifest
+├── checkpoints/               # Final model checkpoints used by predict_affinity.py
 ├── plan.md                    # Development plan and progress
 ├── PDBind_2020/               # PDBbind 2020 full general set (~19,000 complexes)
 │   ├── 1981-2000/
@@ -523,13 +547,17 @@ AItenea_Docking/
 │           ├── {pdb_code}_ligand.mol2
 │           └── {pdb_code}_protein.pdb
 └── output/
-    ├── training_data.csv      # Generated by initial Vina run; reused with --load-csv
-    ├── val_data.csv
-    ├── test_data.csv          # CASF-2016 complexes
-    ├── best_hyperparams.json
-    ├── best_hyperparams_fp.json
-    ├── gnn_best_hyperparams.json
-    ├── gnn_model.pt
+    ├── pool_data.csv          # Combined non-CASF pose pool (input to split_data.py)
+    ├── casf_results.csv       # CASF-2016 docking results (test set source)
+    ├── training_data.csv      # Train split (reused with --load-csv)
+    ├── val_data.csv           # Val split
+    ├── test_data.csv          # Test split (CASF-2016 complexes)
+    ├── training_data_aug.csv  # + contact_* columns (DimeNet input; from augment_csvs.py)
+    ├── val_data_aug.csv
+    ├── test_data_aug.csv
+    ├── svr_affinity_fp_pose_model.joblib   # + _metadata.json
+    ├── dimenet_model.pt       # + dimenet_best_hyperparams.json
+    ├── best_hyperparams*.json
     └── *.png
 ```
 
@@ -537,31 +565,61 @@ AItenea_Docking/
 
 ## Recommended workflow
 
+This is the end-to-end path actually used for the full PDBbind 2020 run (docking on an
+HPC cluster, training the two production models, then inference).
+
 ```bash
-# 1. Run Vina on all complexes and generate fixed CSVs (first time only — slow)
-#    CASF-2016 → test_data.csv; PDBind_2020 non-CASF → training_data.csv + val_data.csv
-python process_pdbind.py --num-complexes 19000
+# 1. Dock all non-CASF complexes on the cluster (SLURM job array; see vina_docking.py).
+#    Each task writes output/vina_batch_*.csv. Then combine the batches:
+python - <<'EOF'
+import pandas as pd, glob
+files = sorted(glob.glob('output/vina_batch_*.csv')) + sorted(glob.glob('output/vina_remaining_*.csv'))
+pd.concat([pd.read_csv(f) for f in files], ignore_index=True).to_csv('output/pool_data.csv', index=False)
+EOF
 
-# 2. Fast iteration on saved CSVs (no Vina, no augmentation re-run)
-python process_pdbind.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
+# 2. Dock the CASF-2016 test set once (separate job)
+python vina_docking.py --casf --cpus 8          # → output/casf_results.csv
 
-# 3. Optimise hyperparameters for all models, save results
+# 3. Split into fixed train/val/test (by complex, seed 42; CASF = test)
+python split_data.py
+#    → output/training_data.csv, output/val_data.csv, output/test_data.csv
+
+# 4. (DimeNet only) add the 12 contact_* columns the protein-feature model needs
+python augment_csvs.py
+#    → output/training_data_aug.csv, output/val_data_aug.csv, output/test_data_aug.csv
+
+# 5a. Pose-aware SVR + fingerprints — optimise, train, evaluate, save
 python process_pdbind.py \
   --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --optimize-hyperparams --n-trials 30 --optuna-db output/optuna_studies.db
+  --no-augment --no-plots --no-ranking \
+  --affinity-compare-features --pose-aware-affinity \
+  --optimize-hyperparams --optimize-models svr_affinity_fp --n-trials 30
+#    → output/svr_affinity_fp_pose_model.joblib (+ _metadata.json)
 
-# 4. Re-run with saved hyperparameters (no Optuna overhead)
-python process_pdbind.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --load-hyperparams output/best_hyperparams.json
+# 5b. DimeNet++ with protein features — optimise, train, evaluate, save (GPU recommended)
+python gnn_dimenet_affinity.py \
+  --load-csv output/training_data_aug.csv output/test_data_aug.csv output/val_data_aug.csv \
+  --optimize-hyperparams --n-trials 30 --device cuda
+#    → output/dimenet_model.pt (+ dimenet_best_hyperparams.json)
 
-# 5. Run GNN affinity model
-python gnn_affinity.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv
-
-# 6. Optimise GNN hyperparameters
-python gnn_affinity.py \
-  --load-csv output/training_data.csv output/test_data.csv output/val_data.csv \
-  --optimize-hyperparams --n-trials 30 --optuna-db output/gnn_optuna.db
+# 6. Collect the final checkpoints, then predict on new ligands
+mkdir -p checkpoints
+cp output/svr_affinity_fp_pose_model.joblib output/svr_affinity_fp_pose_metadata.json \
+   output/dimenet_model.pt checkpoints/
+python predict_affinity.py --manifest example_manifest.csv --model svr_fp_pose --output preds_svr.csv
+python predict_affinity.py --manifest example_manifest.csv --model dimenet --device cpu --output preds_dimenet.csv
 ```
+
+> **Alternative (single machine):** `process_pdbind.py --num-complexes 19000` will run
+> Vina on everything and produce the three CSVs directly (see the *Initial run* section
+> above), instead of steps 1–3.
+>
+> **Pose ranking** (XGB/RF/GB rankers + ensemble) still lives in `process_pdbind.py` and
+> runs by default unless `--no-ranking` is passed; the `gnn_affinity.py` GINEConv model
+> remains available for affinity experiments. Neither is part of the two-model production
+> path above.
+>
+> **HPC dependency notes:** RDKit needs `numpy<2`; DimeNet++ needs a working
+> `torch-cluster` matching your torch build and does **not** support Apple MPS (use
+> `--device cpu`/`cuda`); Optuna's SQLite `--optuna-db` does not work on Lustre — omit it
+> to run in-memory.

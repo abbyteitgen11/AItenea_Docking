@@ -1,47 +1,37 @@
 """
 predict_affinity.py — Standalone binding affinity prediction for new ligands.
 
-Loads a pre-trained SVR+fingerprints or GNN model and predicts binding affinity
-(ΔG, kcal/mol) for Vina-docked poses of novel ligands.
+Loads a pre-trained, final model checkpoint and predicts binding affinity
+(ΔG, kcal/mol) for Vina-docked poses of novel ligands. This script performs
+inference only — it does not train anything. Supply the checkpoint(s) produced by
+the training pipeline (by default it looks in checkpoints/).
 
-Input: a manifest CSV listing ligand mol2 files, protein PDB files, and Vina
-       PDBQT outputs.
+Input:  a manifest CSV listing ligand mol2 files, Vina PDBQT outputs, and
+        (for DimeNet) protein PDB files.
 Output: a CSV with one row per (ligand, pose) containing the Vina score and the
-        ML-predicted ΔG.
+        ML-predicted ΔG. Both supported models are pose-aware, so each pose of a
+        ligand gets its own prediction.
 
-Model options
-─────────────
-  svr_fp       Per-ligand SVR+fingerprints. All poses of the same ligand get the
-               same predicted ΔG (model uses only molecular structure).
-  gnn          Per-ligand GNN. Same caveat as svr_fp.
-  svr_fp_pose  Pose-aware SVR+fingerprints. Trained on all Vina poses with Vina
-               score as an additional feature; produces a different ΔG per pose.
-  gnn_pose     Pose-aware GNN. Graph embedding + Vina score concatenated before the
-               MLP head; produces a different ΔG per pose.
-  dimenet      DimeNet++ GNN with protein feature augmentation. Uses 3D ligand
-               coordinates and protein–ligand contact scalars; produces different
-               ΔG per pose because contact features differ between docked poses.
+Models
+──────
+  svr_fp_pose  Pose-aware SVR + Morgan fingerprints. Trained on all Vina poses with
+               the Vina score as an extra feature; produces a different ΔG per pose.
+               Checkpoint: a joblib pipeline + a metadata JSON.
+  dimenet      DimeNet++ GNN with protein-feature augmentation. Uses 3D ligand
+               coordinates and 12 protein–ligand contact scalars computed per pose;
+               produces a different ΔG per pose. Checkpoint: a single .pt file.
 
 Usage:
-    # Per-ligand models (same ΔG for all poses of one ligand)
-    python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp \\
-        --svr-model output/svr_affinity_fp_model.joblib \\
-        --svr-meta  output/svr_affinity_fp_metadata.json --output predictions.csv
-
-    python predict_affinity.py --manifest inputs/manifest.csv --model gnn \\
-        --gnn-model output/gnn_model.pt --output predictions.csv
-
-    # Pose-aware models (different ΔG per pose)
+    # Pose-aware SVR + fingerprints
     python predict_affinity.py --manifest inputs/manifest.csv --model svr_fp_pose \\
-        --svr-model output/svr_affinity_fp_pose_model.joblib \\
-        --svr-meta  output/svr_affinity_fp_pose_metadata.json --output predictions.csv
+        --svr-model checkpoints/svr_affinity_fp_pose_model.joblib \\
+        --svr-meta  checkpoints/svr_affinity_fp_pose_metadata.json \\
+        --output predictions_svr_pose.csv
 
-    python predict_affinity.py --manifest inputs/manifest.csv --model gnn_pose \\
-        --gnn-model output/gnn_pose_model.pt --output predictions.csv
-
-    # DimeNet++ with protein features (pose-aware by nature)
+    # DimeNet++ with protein features
     python predict_affinity.py --manifest inputs/manifest.csv --model dimenet \\
-        --gnn-model output/dimenet_model.pt --output predictions_dimenet.csv
+        --dimenet-model checkpoints/dimenet_model.pt \\
+        --output predictions_dimenet.csv
 """
 
 import argparse
@@ -55,15 +45,237 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import AllChem
-
-sys.path.insert(0, str(Path(__file__).parent))
-from process_pdbind import (  # noqa: E402
-    compute_morgan_fingerprint,
-    load_protein_atoms,
-    extract_pose_atoms,
-    compute_pose_contact_features,
-)
 from scipy.spatial import KDTree
+
+
+# ---------------------------------------------------------------------------
+# Inlined structure / feature helpers (self-contained — no project imports)
+# ---------------------------------------------------------------------------
+
+def compute_morgan_fingerprint(mol2_path: Path, n_bits: int = 2048) -> Optional[np.ndarray]:
+    """
+    Compute Morgan ECFP4 fingerprint (radius=2) from a mol2 file.
+
+    Returns:
+        np.ndarray of shape (n_bits,) with dtype float32, or None if parsing fails.
+    """
+    mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)
+    if mol is None:
+        return None
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
+    return np.array(fp, dtype=np.float32)
+
+
+def extract_pose_atoms(pdbqt_file: Path) -> List[Tuple[np.ndarray, List[str]]]:
+    """
+    Extract atom coordinates and AutoDock atom types for each pose from a Vina PDBQT file.
+
+    Returns:
+        List of (coords_array, atom_types_list) per pose; HD (donor hydrogen) atoms excluded.
+    """
+    poses: List[Tuple[np.ndarray, List[str]]] = []
+    current_coords: List[List[float]] = []
+    current_types: List[str] = []
+
+    try:
+        with open(pdbqt_file, 'r') as f:
+            for line in f:
+                line = line.rstrip()
+                if line.startswith('MODEL'):
+                    current_coords = []
+                    current_types = []
+                elif line.startswith('ENDMDL'):
+                    if current_coords:
+                        poses.append((np.array(current_coords, dtype=np.float32), current_types))
+                    current_coords = []
+                    current_types = []
+                elif line.startswith('ATOM') or line.startswith('HETATM'):
+                    # AutoDock atom type is the last whitespace-delimited token on the line
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    adt_type = parts[-1]
+                    # Skip donor hydrogens
+                    if adt_type == 'HD':
+                        continue
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        current_coords.append([x, y, z])
+                        current_types.append(adt_type)
+                    except (ValueError, IndexError):
+                        continue
+    except Exception:
+        return poses
+
+    if current_coords:
+        poses.append((np.array(current_coords, dtype=np.float32), current_types))
+
+    return poses
+
+
+def load_protein_atoms(
+    protein_pdb: Path,
+) -> Optional[Tuple[np.ndarray, List[str], List[str]]]:
+    """
+    Parse a protein PDB file and return heavy-atom coordinates, elements, and residue names.
+
+    Returns:
+        Tuple of (coords array (N,3), elements list, resnames list), or None if parsing fails
+    """
+    coords, elements, resnames = [], [], []
+    try:
+        with open(protein_pdb, 'r') as f:
+            for line in f:
+                if not (line.startswith('ATOM') or line.startswith('HETATM')):
+                    continue
+                atom_name = line[12:16].strip()
+                # Determine element: prefer element column (76-78), fall back to atom name
+                element = ''
+                if len(line) >= 78:
+                    element = line[76:78].strip().upper()
+                if not element:
+                    # Infer from atom name: strip leading digits, take first letter
+                    stripped = atom_name.lstrip('0123456789')
+                    element = stripped[0].upper() if stripped else ''
+                # Skip hydrogens
+                if element == 'H':
+                    continue
+                if not element and (atom_name.startswith('H') or
+                                    (len(atom_name) > 1 and atom_name[1] == 'H')):
+                    continue
+                resname = line[17:20].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+                    elements.append(element)
+                    resnames.append(resname)
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        print(f"    Warning: Could not parse protein PDB {protein_pdb}: {e}")
+        return None
+
+    if not coords:
+        return None
+    return np.array(coords, dtype=np.float32), elements, resnames
+
+
+_POLAR_LIG_TYPES = {'OA', 'NA', 'N', 'O'}
+_HYDROPHOBIC_LIG_TYPES = {'C', 'A'}
+
+
+def compute_pose_contact_features(
+    ligand_coords: np.ndarray,
+    protein_tree: KDTree,
+    ligand_atom_types: Optional[List[str]] = None,
+    protein_hydrophobic_tree: Optional[KDTree] = None,
+    protein_polar_tree: Optional[KDTree] = None,
+    protein_aromatic_tree: Optional[KDTree] = None,
+) -> Dict:
+    """
+    Compute protein–ligand contact features using a pre-built KDTree of protein atoms.
+
+    Args:
+        ligand_coords: (N_ligand, 3) array of ligand heavy-atom coordinates
+        protein_tree:  KDTree built from all protein heavy-atom coordinates
+        ligand_atom_types: AutoDock atom types per ligand atom (enables chemical features)
+        protein_hydrophobic_tree: KDTree of protein C/S atoms
+        protein_polar_tree: KDTree of protein N/O atoms
+        protein_aromatic_tree: KDTree of protein atoms in aromatic residues
+
+    Returns:
+        Dictionary of contact feature values
+    """
+    all_base_keys = ['contact_n_3A', 'contact_n_4A', 'contact_n_5A',
+                     'contact_min_dist', 'contact_score_lj',
+                     'contact_buried_frac', 'contact_n_per_atom']
+    all_rich_keys = ['contact_n_hydrophobic', 'contact_n_hbond', 'contact_n_aromatic',
+                     'contact_score_gaussian', 'contact_hbond_normalized']
+    n_lig = len(ligand_coords)
+    if n_lig == 0:
+        return {k: np.nan for k in all_base_keys + all_rich_keys}
+
+    # Count contacts at different radii
+    counts_5A = protein_tree.query_ball_point(ligand_coords, r=5.0, return_length=True)
+    counts_4A = protein_tree.query_ball_point(ligand_coords, r=4.0, return_length=True)
+    counts_3A = protein_tree.query_ball_point(ligand_coords, r=3.0, return_length=True)
+
+    n_5A = int(counts_5A.sum())
+    n_4A = int(counts_4A.sum())
+    n_3A = int(counts_3A.sum())
+
+    # Minimum protein–ligand distance per ligand atom
+    min_dists, _ = protein_tree.query(ligand_coords, k=1)
+    min_dist = float(min_dists.min())
+
+    # Approximate attractive LJ term: Σ (1/r^6), capped at r > 0.5 Å to avoid singularity
+    lj_score = float(np.sum(1.0 / np.maximum(min_dists, 0.5) ** 6))
+
+    # Fraction of ligand atoms "buried" (at least one protein atom within 4.5 Å)
+    counts_45A = protein_tree.query_ball_point(ligand_coords, r=4.5, return_length=True)
+    buried_frac = float((counts_45A > 0).sum() / n_lig)
+
+    result = {
+        'contact_n_3A': n_3A,
+        'contact_n_4A': n_4A,
+        'contact_n_5A': n_5A,
+        'contact_min_dist': min_dist,
+        'contact_score_lj': lj_score,
+        'contact_buried_frac': buried_frac,
+        'contact_n_per_atom': n_4A / n_lig,
+    }
+
+    # --- Atom-type-aware features (only when type info is available) ---
+    if ligand_atom_types is not None:
+        lig_hphob_mask = np.array([t in _HYDROPHOBIC_LIG_TYPES for t in ligand_atom_types])
+        lig_polar_mask  = np.array([t in _POLAR_LIG_TYPES       for t in ligand_atom_types])
+        n_polar_lig = int(lig_polar_mask.sum())
+
+        # Hydrophobic contacts
+        contact_n_hydrophobic = np.nan
+        if protein_hydrophobic_tree is not None and lig_hphob_mask.any():
+            hphob_counts = protein_hydrophobic_tree.query_ball_point(
+                ligand_coords[lig_hphob_mask], r=4.5, return_length=True)
+            contact_n_hydrophobic = int(hphob_counts.sum())
+
+        # H-bond contacts
+        contact_n_hbond = np.nan
+        if protein_polar_tree is not None and lig_polar_mask.any():
+            hbond_counts = protein_polar_tree.query_ball_point(
+                ligand_coords[lig_polar_mask], r=3.5, return_length=True)
+            contact_n_hbond = int(hbond_counts.sum())
+        else:
+            contact_n_hbond = 0
+
+        # Aromatic contacts
+        contact_n_aromatic = np.nan
+        if protein_aromatic_tree is not None:
+            arom_counts = protein_aromatic_tree.query_ball_point(
+                ligand_coords, r=5.0, return_length=True)
+            contact_n_aromatic = int(arom_counts.sum())
+
+        # Gaussian-weighted contact score (smooth version of shell counts)
+        contact_score_gaussian = float(np.sum(np.exp(-min_dists ** 2 / 8.0)))
+
+        # H-bonds normalised by polar ligand atom count
+        contact_hbond_normalized = (float(contact_n_hbond) / max(n_polar_lig, 1)
+                                    if not np.isnan(contact_n_hbond) else np.nan)
+
+        result.update({
+            'contact_n_hydrophobic':   contact_n_hydrophobic,
+            'contact_n_hbond':         contact_n_hbond,
+            'contact_n_aromatic':      contact_n_aromatic,
+            'contact_score_gaussian':  contact_score_gaussian,
+            'contact_hbond_normalized': contact_hbond_normalized,
+        })
+    else:
+        result.update({k: np.nan for k in all_rich_keys})
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -96,159 +308,45 @@ def parse_pdbqt_scores(pdbqt_path: Path) -> List[Tuple[int, float]]:
     return poses
 
 
+def _resolve_path(p: str, base_dir: Path) -> Path:
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    return base_dir / path
+
+
+def _pose_scalar_vec(pose_feature_cols: List[str], vina_score: float) -> np.ndarray:
+    """Build a pose scalar vector from a feature column list and the current Vina score.
+
+    Currently only 'vina_score' is supported as a pose feature col name; other columns
+    are set to 0 (they require protein structure computation not available at inference
+    without additional inputs).
+    """
+    vals = []
+    for col in pose_feature_cols:
+        if col == 'vina_score':
+            vals.append(vina_score)
+        else:
+            vals.append(0.0)
+    return np.array(vals, dtype=np.float32)
+
+
 # ---------------------------------------------------------------------------
-# SVR + fingerprints
+# Pose-aware SVR + fingerprints
 # ---------------------------------------------------------------------------
 
 def load_svr_fp(model_path: Path, meta_path: Path):
-    """Load the joblib SVR pipeline and its feature column list."""
+    """Load the joblib SVR pipeline and its fingerprint/pose metadata.
+
+    Pose-aware metadata stores 'combined_feature_cols' and 'fp_n_bits'; the older
+    per-ligand format used 'feature_cols'/'n_bits'. Accept either for robustness.
+    """
     pipeline = joblib.load(model_path)
     meta = json.loads(meta_path.read_text())
-    feature_cols: List[str] = meta['feature_cols']
-    n_bits: int = meta.get('n_bits', 2048)
+    feature_cols: List[str] = meta.get('feature_cols') or meta.get('combined_feature_cols')
+    n_bits: int = meta.get('n_bits') or meta.get('fp_n_bits', 2048)
     return pipeline, feature_cols, n_bits
 
-
-def predict_svr_fp(
-    manifest_df: pd.DataFrame,
-    pipeline,
-    feature_cols: List[str],
-    n_bits: int,
-    manifest_dir: Path,
-) -> Dict[str, Optional[float]]:
-    """
-    Predict ΔG for each unique ligand using the SVR+fingerprints pipeline.
-
-    Returns a dict mapping ligand_id → predicted ΔG (or None if mol2 fails).
-    """
-    predictions: Dict[str, Optional[float]] = {}
-    seen_ids = set()
-    for row in manifest_df.itertuples(index=False):
-        lid = row.ligand_id
-        if lid in seen_ids:
-            continue
-        seen_ids.add(lid)
-
-        mol2_path = _resolve_path(row.ligand_mol2, manifest_dir)
-        fp = compute_morgan_fingerprint(mol2_path, n_bits=n_bits)
-        if fp is None:
-            print(f"  Warning: could not parse mol2 for {lid} — skipping")
-            predictions[lid] = None
-            continue
-
-        # Build feature vector matching the column order the model was trained on
-        fp_dict = {f'morgan_fp_{i}': fp[i] for i in range(len(fp))}
-        X = np.array([[fp_dict.get(c, 0.0) for c in feature_cols]], dtype=np.float32)
-        X = np.nan_to_num(X, nan=0.0)
-        predictions[lid] = float(pipeline.predict(X)[0])
-
-    return predictions
-
-
-# ---------------------------------------------------------------------------
-# GNN
-# ---------------------------------------------------------------------------
-
-def load_gnn(model_path: Path, device: str):
-    """Load the saved GNN model and return (model, torch_device, pose_feature_cols)."""
-    try:
-        import torch
-        from gnn_affinity import AffinityGNN
-    except ImportError as e:
-        sys.exit(f"Error: could not import GNN dependencies ({e}). "
-                 "Ensure torch and torch_geometric are installed.")
-
-    torch_device = torch.device(device)
-    checkpoint = torch.load(model_path, map_location=torch_device)
-    hp = checkpoint['hyperparams']
-    node_dim           = checkpoint.get('node_dim', 28)
-    edge_dim           = checkpoint.get('edge_dim', 7)
-    n_pose_features    = checkpoint.get('n_pose_features', 0)
-    pose_feature_cols  = checkpoint.get('pose_feature_cols', [])
-
-    model = AffinityGNN(
-        node_dim=node_dim,
-        edge_dim=edge_dim,
-        hidden_dim=hp.get('hidden_dim', 128),
-        n_layers=hp.get('n_layers', 3),
-        dropout=hp.get('dropout', 0.1),
-        n_pose_features=n_pose_features,
-    )
-    model.load_state_dict(checkpoint['state_dict'])
-    model.to(torch_device)
-    model.eval()
-    return model, torch_device, pose_feature_cols
-
-
-def predict_gnn(
-    manifest_df: pd.DataFrame,
-    model,
-    device,
-    manifest_dir: Path,
-) -> Dict[str, Optional[float]]:
-    """
-    Predict ΔG for each unique ligand using the GNN model.
-
-    Returns a dict mapping ligand_id → predicted ΔG (or None if mol2 fails).
-    """
-    try:
-        import torch
-        from gnn_affinity import mol_to_graph
-        from torch_geometric.loader import DataLoader
-    except ImportError as e:
-        sys.exit(f"Error: could not import GNN dependencies ({e}).")
-
-    # Build one graph per unique ligand
-    graphs = []
-    ligand_ids = []
-    seen_ids: set = set()
-
-    for row in manifest_df.itertuples(index=False):
-        lid = row.ligand_id
-        if lid in seen_ids:
-            continue
-        seen_ids.add(lid)
-
-        mol2_path = _resolve_path(row.ligand_mol2, manifest_dir)
-        mol = None
-        if mol2_path.exists():
-            mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)
-        graph = mol_to_graph(mol, y=0.0) if mol is not None else None
-
-        if graph is None:
-            print(f"  Warning: could not parse mol2 for {lid} — skipping")
-            ligand_ids.append(lid)
-            graphs.append(None)
-        else:
-            ligand_ids.append(lid)
-            graphs.append(graph)
-
-    valid_graphs = [g for g in graphs if g is not None]
-    valid_ids = [lid for lid, g in zip(ligand_ids, graphs) if g is not None]
-    failed_ids = {lid for lid, g in zip(ligand_ids, graphs) if g is None}
-
-    predictions: Dict[str, Optional[float]] = {lid: None for lid in failed_ids}
-
-    if not valid_graphs:
-        return predictions
-
-    loader = DataLoader(valid_graphs, batch_size=64, shuffle=False)
-    preds = []
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch).squeeze(-1)
-            preds.extend(out.cpu().numpy().tolist())
-
-    for lid, pred in zip(valid_ids, preds):
-        predictions[lid] = float(pred)
-
-    return predictions
-
-
-# ---------------------------------------------------------------------------
-# Pose-aware prediction (different ΔG per pose)
-# ---------------------------------------------------------------------------
 
 def predict_svr_fp_pose(
     manifest_df: pd.DataFrame,
@@ -306,82 +404,6 @@ def predict_svr_fp_pose(
     return pd.DataFrame(rows)
 
 
-def predict_gnn_pose(
-    manifest_df: pd.DataFrame,
-    model,
-    device,
-    pose_feature_cols: List[str],
-    manifest_dir: Path,
-) -> pd.DataFrame:
-    """
-    Predict ΔG per (ligand, pose) using the pose-aware GNN.
-
-    For each pose: builds a copy of the ligand graph with pose_feats attached,
-    then runs a batched forward pass.
-
-    Returns a DataFrame with columns: ligand_id, pose_idx, vina_score,
-    predicted_affinity_kcal_mol, model.
-    """
-    try:
-        import torch
-        from gnn_affinity import mol_to_graph
-        from torch_geometric.loader import DataLoader
-    except ImportError as e:
-        sys.exit(f"Error: could not import GNN dependencies ({e}).")
-
-    # Cache parsed molecules per ligand
-    mol_cache: Dict[str, object] = {}
-    for row in manifest_df.itertuples(index=False):
-        lid = row.ligand_id
-        if lid not in mol_cache:
-            mol2_path = _resolve_path(row.ligand_mol2, manifest_dir)
-            mol = None
-            if mol2_path.exists():
-                mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)
-            mol_cache[lid] = mol
-            if mol is None:
-                print(f"  Warning: could not parse mol2 for {lid} — skipping")
-
-    graphs = []
-    meta: List[dict] = []
-
-    for row in manifest_df.itertuples(index=False):
-        lid = row.ligand_id
-        mol = mol_cache.get(lid)
-        if mol is None:
-            continue
-        pdbqt_path = _resolve_path(row.vina_pdbqt, manifest_dir)
-        poses = parse_pdbqt_scores(pdbqt_path)
-        if not poses:
-            print(f"  Warning: no poses in {pdbqt_path} for {lid}")
-            continue
-        for pose_idx, vina_score in poses:
-            graph = mol_to_graph(mol, y=0.0)
-            if graph is None:
-                continue
-            pose_vals = _pose_scalar_vec(pose_feature_cols, vina_score)
-            graph.pose_feats = torch.tensor([pose_vals.tolist()], dtype=torch.float)
-            graphs.append(graph)
-            meta.append({'ligand_id': lid, 'pose_idx': pose_idx, 'vina_score': vina_score})
-
-    if not graphs:
-        return pd.DataFrame(columns=['ligand_id', 'pose_idx', 'vina_score',
-                                     'predicted_affinity_kcal_mol', 'model'])
-
-    loader = DataLoader(graphs, batch_size=64, shuffle=False)
-    preds = []
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch).squeeze(-1)
-            preds.extend(out.cpu().numpy().tolist())
-
-    rows = []
-    for m, pred in zip(meta, preds):
-        rows.append({**m, 'predicted_affinity_kcal_mol': float(pred), 'model': 'gnn_pose'})
-    return pd.DataFrame(rows)
-
-
 # ---------------------------------------------------------------------------
 # DimeNet++ with protein feature augmentation
 # ---------------------------------------------------------------------------
@@ -420,8 +442,6 @@ def compute_contact_feats_for_pose(
 
     protein_tree = KDTree(protein_coords)
 
-    prot_elem_arr = np.array(prot_elements)
-    prot_res_arr = np.array(prot_resnames)
     hphob_mask = np.array([e in _HYDROPHOBIC_ELEMENTS_INF for e in prot_elements])
     polar_mask = np.array([e in _POLAR_ELEMENTS_INF for e in prot_elements])
     aromatic_mask = np.array([r in _AROMATIC_RESNAMES_INF for r in prot_resnames])
@@ -450,14 +470,73 @@ def compute_contact_feats_for_pose(
     return np.array(vals, dtype=np.float32)
 
 
+def _build_dimenet_affinity(**kwargs):
+    """Construct the DimeNet++ affinity model. Defined lazily so torch/torch_geometric
+    are only required for `--model dimenet` (svr_fp_pose stays torch-free)."""
+    import torch.nn as nn
+    from torch_geometric.data import Data
+    from torch_geometric.nn import DimeNetPlusPlus
+
+    class DimeNetAffinity(nn.Module):
+        """
+        DimeNet++ GNN for binding affinity regression with optional protein augmentation.
+
+        Architecture:
+            DimeNetPlusPlus (ligand 3D graph) → graph embedding (out_channels,)
+            → cat([embedding, protein_feats]) if n_protein_features > 0
+            → MLP: Linear → ReLU → Dropout → Linear → scalar ΔG
+        """
+
+        def __init__(
+            self,
+            hidden_channels: int = 128,
+            out_channels: int = 128,
+            num_blocks: int = 4,
+            int_emb_size: int = 64,
+            basis_emb_size: int = 8,
+            out_emb_channels: int = 256,
+            n_protein_features: int = 0,
+            dropout: float = 0.1,
+        ):
+            super().__init__()
+            self.n_protein_features = n_protein_features
+            self.gnn = DimeNetPlusPlus(
+                hidden_channels=hidden_channels,
+                out_channels=out_channels,
+                num_blocks=num_blocks,
+                int_emb_size=int_emb_size,
+                basis_emb_size=basis_emb_size,
+                out_emb_channels=out_emb_channels,
+                num_spherical=7,
+                num_radial=6,
+                cutoff=5.0,
+            )
+            head_in = out_channels + n_protein_features
+            self.head = nn.Sequential(
+                nn.Linear(head_in, hidden_channels),
+                nn.ReLU(),
+                nn.Dropout(p=dropout),
+                nn.Linear(hidden_channels, 1),
+            )
+
+        def forward(self, data: Data) -> "object":
+            import torch
+            # DimeNetPlusPlus returns (batch_size, out_channels) — global pooling is internal
+            emb = self.gnn(data.z, data.pos, data.batch)
+            if self.n_protein_features > 0 and hasattr(data, 'protein_feats') and data.protein_feats is not None:
+                emb = torch.cat([emb, data.protein_feats], dim=-1)
+            return self.head(emb).squeeze(-1)
+
+    return DimeNetAffinity(**kwargs)
+
+
 def load_dimenet(model_path: Path, device: str):
-    """Load the saved DimeNetAffinity model and return (model, torch_device, protein_feature_cols)."""
+    """Load the saved DimeNet++ model and return (model, torch_device, protein_feature_cols)."""
     try:
         import torch
-        from gnn_dimenet_affinity import DimeNetAffinity
     except ImportError as e:
         sys.exit(f"Error: could not import DimeNet dependencies ({e}). "
-                 "Ensure torch and torch_geometric are installed.")
+                 "Ensure torch and torch_geometric (with torch-cluster) are installed.")
 
     torch_device = torch.device(device)
     checkpoint = torch.load(model_path, map_location=torch_device)
@@ -465,7 +544,7 @@ def load_dimenet(model_path: Path, device: str):
     n_protein_features = checkpoint.get('n_protein_features', 0)
     protein_feature_cols = checkpoint.get('protein_feature_cols', [])
 
-    model = DimeNetAffinity(
+    model = _build_dimenet_affinity(
         hidden_channels=hp.get('hidden_channels', 128),
         out_channels=hp.get('out_channels', 128),
         num_blocks=hp.get('num_blocks', 4),
@@ -504,10 +583,41 @@ def predict_dimenet(
     """
     try:
         import torch
-        from gnn_dimenet_affinity import mol_to_graph_3d
+        from torch_geometric.data import Data
         from torch_geometric.loader import DataLoader
     except ImportError as e:
         sys.exit(f"Error: could not import DimeNet dependencies ({e}).")
+
+    def mol_to_graph_3d(mol, y: float = 0.0, protein_feats: Optional[List[float]] = None):
+        """Convert an RDKit molecule with a 3D conformer to a PyG Data object for DimeNet++.
+
+        Requires z (atomic numbers) and pos (3D coordinates). Returns None if the molecule
+        is missing, has no atoms, or has no conformer.
+        """
+        if mol is None or mol.GetNumAtoms() == 0:
+            return None
+        try:
+            conf = mol.GetConformer()
+        except ValueError:
+            return None
+        try:
+            pos = torch.tensor(
+                [[conf.GetAtomPosition(i).x,
+                  conf.GetAtomPosition(i).y,
+                  conf.GetAtomPosition(i).z]
+                 for i in range(mol.GetNumAtoms())],
+                dtype=torch.float,
+            )
+            z = torch.tensor(
+                [atom.GetAtomicNum() for atom in mol.GetAtoms()],
+                dtype=torch.long,
+            )
+            data = Data(z=z, pos=pos, y=torch.tensor([y], dtype=torch.float))
+            if protein_feats is not None:
+                data.protein_feats = torch.tensor([protein_feats], dtype=torch.float)
+            return data
+        except Exception:
+            return None
 
     n_prot = model.n_protein_features
 
@@ -576,71 +686,6 @@ def predict_dimenet(
     return pd.DataFrame(rows)
 
 
-def _pose_scalar_vec(pose_feature_cols: List[str], vina_score: float) -> np.ndarray:
-    """Build a pose scalar vector from a feature column list and the current Vina score.
-
-    Currently only 'vina_score' is supported as a pose feature col name; other columns
-    are set to 0 (they require protein structure computation not available at inference
-    without additional inputs).
-    """
-    vals = []
-    for col in pose_feature_cols:
-        if col == 'vina_score':
-            vals.append(vina_score)
-        else:
-            vals.append(0.0)
-    return np.array(vals, dtype=np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Result assembly
-# ---------------------------------------------------------------------------
-
-def _resolve_path(p: str, base_dir: Path) -> Path:
-    path = Path(p)
-    if path.is_absolute():
-        return path
-    return base_dir / path
-
-
-def build_results_df(
-    manifest_df: pd.DataFrame,
-    predictions: Dict[str, Optional[float]],
-    model_name: str,
-    manifest_dir: Path,
-) -> pd.DataFrame:
-    """
-    Combine Vina pose scores with per-ligand ML predictions into a results table.
-
-    Each row corresponds to one (ligand_id, pose_idx) pair.
-    """
-    rows = []
-    for row in manifest_df.itertuples(index=False):
-        lid = row.ligand_id
-        pred = predictions.get(lid)
-        pdbqt_path = _resolve_path(row.vina_pdbqt, manifest_dir)
-        poses = parse_pdbqt_scores(pdbqt_path)
-        if not poses:
-            print(f"  Warning: no poses found in {pdbqt_path} for {lid}")
-            rows.append({
-                'ligand_id': lid,
-                'pose_idx': None,
-                'vina_score': None,
-                'predicted_affinity_kcal_mol': pred,
-                'model': model_name,
-            })
-            continue
-        for pose_idx, vina_score in poses:
-            rows.append({
-                'ligand_id': lid,
-                'pose_idx': pose_idx,
-                'vina_score': vina_score,
-                'predicted_affinity_kcal_mol': pred,
-                'model': model_name,
-            })
-    return pd.DataFrame(rows)
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -661,32 +706,32 @@ def _select_device(requested: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Predict binding affinity for Vina-docked poses using a pre-trained ML model.',
+        description='Predict binding affinity for Vina-docked poses using a pre-trained, '
+                    'final model checkpoint (inference only — no training).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--manifest', required=True,
-                        help='CSV with columns: ligand_id, ligand_mol2, protein_pdb, vina_pdbqt')
+                        help='CSV with columns: ligand_id, ligand_mol2, vina_pdbqt '
+                             '(plus protein_pdb when --model dimenet).')
     parser.add_argument('--model', required=True,
-                        choices=['svr_fp', 'gnn', 'svr_fp_pose', 'gnn_pose', 'dimenet'],
-                        help='Model to use. Per-ligand (same ΔG for all poses): svr_fp, gnn. '
-                             'Pose-aware (different ΔG per pose): svr_fp_pose, gnn_pose, dimenet.')
+                        choices=['svr_fp_pose', 'dimenet'],
+                        help='Pose-aware model to run (different ΔG per pose): '
+                             'svr_fp_pose (SVR+fingerprints) or dimenet (DimeNet++ + protein features).')
     parser.add_argument('--svr-model',
-                        default=None,
-                        help='Path to the SVR joblib file. Defaults to '
-                             'output/svr_affinity_fp_model.joblib (svr_fp) or '
-                             'output/svr_affinity_fp_pose_model.joblib (svr_fp_pose).')
+                        default='checkpoints/svr_affinity_fp_pose_model.joblib',
+                        help='Path to the pose-aware SVR joblib checkpoint '
+                             '(default: checkpoints/svr_affinity_fp_pose_model.joblib).')
     parser.add_argument('--svr-meta',
-                        default=None,
-                        help='Path to the SVR metadata JSON. Defaults to '
-                             'output/svr_affinity_fp_metadata.json (svr_fp) or '
-                             'output/svr_affinity_fp_pose_metadata.json (svr_fp_pose).')
-    parser.add_argument('--gnn-model',
-                        default=None,
-                        help='Path to the GNN .pt checkpoint. Defaults to '
-                             'output/gnn_model.pt (gnn), output/gnn_pose_model.pt (gnn_pose), '
-                             'or output/dimenet_model.pt (dimenet).')
+                        default='checkpoints/svr_affinity_fp_pose_metadata.json',
+                        help='Path to the pose-aware SVR metadata JSON '
+                             '(default: checkpoints/svr_affinity_fp_pose_metadata.json).')
+    parser.add_argument('--dimenet-model',
+                        default='checkpoints/dimenet_model.pt',
+                        help='Path to the DimeNet++ .pt checkpoint '
+                             '(default: checkpoints/dimenet_model.pt).')
     parser.add_argument('--device', default='auto', choices=['auto', 'cuda', 'mps', 'cpu'],
-                        help='Device for GNN inference (default: auto)')
+                        help='Device for DimeNet inference (default: auto). '
+                             'Note: DimeNet++ does not support Apple MPS — use cpu or cuda.')
     parser.add_argument('--output', default='predictions.csv',
                         help='Output CSV path (default: predictions.csv)')
     args = parser.parse_args()
@@ -696,7 +741,9 @@ def main() -> None:
         sys.exit(f"Error: manifest file not found: {manifest_path}")
 
     manifest_df = pd.read_csv(manifest_path)
-    required_cols = {'ligand_id', 'ligand_mol2', 'protein_pdb', 'vina_pdbqt'}
+    required_cols = {'ligand_id', 'ligand_mol2', 'vina_pdbqt'}
+    if args.model == 'dimenet':
+        required_cols.add('protein_pdb')  # needed for per-pose contact features
     missing = required_cols - set(manifest_df.columns)
     if missing:
         sys.exit(f"Error: manifest is missing columns: {', '.join(sorted(missing))}")
@@ -705,81 +752,35 @@ def main() -> None:
     n_ligands = manifest_df['ligand_id'].nunique()
     print(f"Loaded manifest: {len(manifest_df)} rows, {n_ligands} unique ligands")
 
-    pose_aware = args.model in ('svr_fp_pose', 'gnn_pose')
-    results_df: pd.DataFrame
-
     if args.model == 'dimenet':
-        default_gnn = 'output/dimenet_model.pt'
-        gnn_model_path = Path(args.gnn_model or default_gnn)
-        if not gnn_model_path.exists():
-            sys.exit(f"Error: DimeNet model file not found: {gnn_model_path}\n"
-                     "Run gnn_dimenet_affinity.py to generate it.")
+        model_path = Path(args.dimenet_model)
+        if not model_path.exists():
+            sys.exit(f"Error: DimeNet checkpoint not found: {model_path}\n"
+                     "Provide it with --dimenet-model /path/to/dimenet_model.pt")
         device = _select_device(args.device)
-        print(f"Loading DimeNet++ model from {gnn_model_path} (device: {device}) ...")
-        model, torch_device, protein_feature_cols = load_dimenet(gnn_model_path, device)
+        print(f"Loading DimeNet++ model from {model_path} (device: {device}) ...")
+        model, torch_device, protein_feature_cols = load_dimenet(model_path, device)
         print(f"  Protein features ({model.n_protein_features}): {protein_feature_cols}")
         print("Computing per-pose predictions (ligand 3D graph + protein contact features) ...")
         results_df = predict_dimenet(
             manifest_df, model, torch_device, protein_feature_cols, manifest_dir)
 
-    elif args.model in ('svr_fp', 'svr_fp_pose'):
-        default_model = ('output/svr_affinity_fp_pose_model.joblib' if pose_aware
-                         else 'output/svr_affinity_fp_model.joblib')
-        default_meta  = ('output/svr_affinity_fp_pose_metadata.json' if pose_aware
-                         else 'output/svr_affinity_fp_metadata.json')
-        svr_model_path = Path(args.svr_model or default_model)
-        svr_meta_path  = Path(args.svr_meta  or default_meta)
-        train_flag = ('--affinity-compare-features --pose-aware-affinity' if pose_aware
-                      else '--affinity-compare-features')
-        for p in (svr_model_path, svr_meta_path):
+    else:  # svr_fp_pose
+        svr_model_path = Path(args.svr_model)
+        svr_meta_path  = Path(args.svr_meta)
+        for label, p in (('--svr-model', svr_model_path), ('--svr-meta', svr_meta_path)):
             if not p.exists():
-                sys.exit(f"Error: model file not found: {p}\n"
-                         f"Run process_pdbind.py with {train_flag} to generate it.")
+                sys.exit(f"Error: SVR checkpoint not found: {p}\n"
+                         f"Provide it with {label} /path/to/file. The pose-aware SVR needs "
+                         "BOTH the .joblib model and its metadata .json.")
         print(f"Loading SVR model from {svr_model_path} ...")
         pipeline, feature_cols, n_bits = load_svr_fp(svr_model_path, svr_meta_path)
         meta_json = json.loads(svr_meta_path.read_text())
-
-        if pose_aware:
-            pose_feature_cols = meta_json.get('pose_feature_cols', ['vina_score'])
-            print(f"  Fingerprint bits: {n_bits}, pose features: {pose_feature_cols}")
-            print("Computing per-pose predictions ...")
-            results_df = predict_svr_fp_pose(
-                manifest_df, pipeline, n_bits, pose_feature_cols, manifest_dir)
-        else:
-            print(f"  Fingerprint bits: {n_bits}, feature columns: {len(feature_cols)}")
-            print("Computing fingerprints and predicting ...")
-            predictions = predict_svr_fp(
-                manifest_df, pipeline, feature_cols, n_bits, manifest_dir)
-            n_predicted = sum(1 for v in predictions.values() if v is not None)
-            n_failed = n_ligands - n_predicted
-            print(f"Predictions: {n_predicted}/{n_ligands} ligands succeeded "
-                  f"({n_failed} failed mol2 parsing)")
-            results_df = build_results_df(manifest_df, predictions, 'svr_fp', manifest_dir)
-
-    else:  # gnn or gnn_pose
-        default_gnn = ('output/gnn_pose_model.pt' if pose_aware else 'output/gnn_model.pt')
-        gnn_model_path = Path(args.gnn_model or default_gnn)
-        train_flag = '--pose-aware' if pose_aware else ''
-        if not gnn_model_path.exists():
-            sys.exit(f"Error: GNN model file not found: {gnn_model_path}\n"
-                     f"Run gnn_affinity.py {train_flag} to generate it.")
-        device = _select_device(args.device)
-        print(f"Loading GNN model from {gnn_model_path} (device: {device}) ...")
-        model, torch_device, pose_feature_cols = load_gnn(gnn_model_path, device)
-
-        if pose_aware:
-            print(f"  Pose features: {pose_feature_cols}")
-            print("Building per-pose graphs and predicting ...")
-            results_df = predict_gnn_pose(
-                manifest_df, model, torch_device, pose_feature_cols, manifest_dir)
-        else:
-            print("Building molecular graphs and predicting ...")
-            predictions = predict_gnn(manifest_df, model, torch_device, manifest_dir)
-            n_predicted = sum(1 for v in predictions.values() if v is not None)
-            n_failed = n_ligands - n_predicted
-            print(f"Predictions: {n_predicted}/{n_ligands} ligands succeeded "
-                  f"({n_failed} failed mol2 parsing)")
-            results_df = build_results_df(manifest_df, predictions, 'gnn', manifest_dir)
+        pose_feature_cols = meta_json.get('pose_feature_cols', ['vina_score'])
+        print(f"  Fingerprint bits: {n_bits}, pose features: {pose_feature_cols}")
+        print("Computing per-pose predictions ...")
+        results_df = predict_svr_fp_pose(
+            manifest_df, pipeline, n_bits, pose_feature_cols, manifest_dir)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

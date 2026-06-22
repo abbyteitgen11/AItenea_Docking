@@ -932,7 +932,10 @@ def augment_affinity_with_fingerprints(
 
     found = 0
     for i, row in enumerate(new_df.itertuples(index=False)):
-        mol2 = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
+        try:
+            mol2 = get_complex_path(row.pdb_code) / f"{row.pdb_code}_ligand.mol2"
+        except FileNotFoundError:
+            mol2 = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
         fp = compute_morgan_fingerprint(mol2, n_bits)
         if fp is not None:
             fp_matrix[i] = fp
@@ -2401,7 +2404,10 @@ def train_pose_aware_svr_fp(
     # Cache fingerprints per pdb_code — all poses of a ligand share the same mol2 file
     fp_cache: Dict[str, Optional[np.ndarray]] = {}
     for pdb_code in train_df['pdb_code'].unique():
-        mol2 = STRUCTURES_DIR / pdb_code / f"{pdb_code}_ligand.mol2"
+        try:
+            mol2 = get_complex_path(pdb_code) / f"{pdb_code}_ligand.mol2"
+        except FileNotFoundError:
+            mol2 = STRUCTURES_DIR / pdb_code / f"{pdb_code}_ligand.mol2"
         fp_cache[pdb_code] = compute_morgan_fingerprint(mol2, fp_n_bits)
 
     fp_cols = [f'morgan_fp_{i}' for i in range(fp_n_bits)]
@@ -2438,6 +2444,51 @@ def train_pose_aware_svr_fp(
           f"{len(combined_cols)} features "
           f"(fp={fp_n_bits} + pose={available_pose_cols})")
     return pipeline, combined_cols
+
+
+def evaluate_pose_aware_svr_fp(
+    pipeline: Pipeline,
+    test_df_aff: pd.DataFrame,
+    pose_feature_cols: List[str],
+    fp_n_bits: int = 2048,
+) -> Dict:
+    """
+    Score the pose-aware SVR+fingerprints model on the test set, one prediction
+    per complex taken from its rank-1 Vina pose (vina_rank == 1), against the
+    experimental ΔG. Returns a metrics dict (n, pearson_r, spearman_r, rmse, mae).
+    """
+    rank1 = test_df_aff[test_df_aff['vina_rank'] == 1].dropna(
+        subset=['exp_affinity_kcal_mol'])
+    y_true: List[float] = []
+    y_pred: List[float] = []
+    for row in rank1.itertuples(index=False):
+        try:
+            mol2 = get_complex_path(row.pdb_code) / f"{row.pdb_code}_ligand.mol2"
+        except FileNotFoundError:
+            mol2 = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
+        fp = compute_morgan_fingerprint(mol2, fp_n_bits)
+        if fp is None:
+            continue
+        pose_vals = np.array(
+            [float(getattr(row, c, 0.0)) for c in pose_feature_cols], dtype=np.float32)
+        X = np.nan_to_num(
+            np.concatenate([fp, pose_vals])[None, :], nan=0.0, posinf=0.0, neginf=0.0)
+        y_pred.append(float(pipeline.predict(X)[0]))
+        y_true.append(float(row.exp_affinity_kcal_mol))
+
+    if len(y_true) < 2:
+        return {'n': len(y_true), 'pearson_r': float('nan'),
+                'spearman_r': float('nan'), 'rmse': float('nan'), 'mae': float('nan')}
+
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    return {
+        'n':          len(y_true),
+        'pearson_r':  float(pearsonr(y_pred_arr, y_true_arr)[0]),
+        'spearman_r': float(spearmanr(y_pred_arr, y_true_arr)[0]),
+        'rmse':       float(np.sqrt(mean_squared_error(y_true_arr, y_pred_arr))),
+        'mae':        float(np.mean(np.abs(y_true_arr - y_pred_arr))),
+    }
 
 
 def evaluate_affinity_model(
@@ -3341,6 +3392,12 @@ def main():
         help='Skip binding affinity prediction step (faster if only pose ranking is needed)'
     )
     parser.add_argument(
+        '--no-ranking',
+        action='store_true',
+        help='Skip the pose-ranking models (xgb/rf/gb + ensemble) and go straight to '
+             'the affinity section. Use when only affinity models are needed.'
+    )
+    parser.add_argument(
         '--optimize-hyperparams',
         action='store_true',
         help='Run Optuna hyperparameter search for RF ranker and GB affinity (~20 min extra)'
@@ -3614,151 +3671,156 @@ def main():
             )
             print(f"  Best XGB params: {xgb_hyperparams}")
 
-    # --- Train all ranker models ---
-    trained = {}
-    print(f"\nTraining xgb_ranker...")
-    trained['xgb_ranker'] = train_ranker_model(train_df, hyperparams=xgb_hyperparams)
-    print(f"Training rf_ranker...")
-    trained['rf_ranker'] = train_rf_ranker(train_df, hyperparams=rf_hyperparams)
-    print(f"Training gb_ranker...")
-    trained['gb_ranker'] = train_gb_ranker(train_df, hyperparams=gb_hyperparams)
+    if args.no_ranking:
+        print("\nSkipping pose-ranking models (--no-ranking).")
+    else:
+        # --- Train all ranker models ---
+        trained = {}
+        print(f"\nTraining xgb_ranker...")
+        trained['xgb_ranker'] = train_ranker_model(train_df, hyperparams=xgb_hyperparams)
+        print(f"Training rf_ranker...")
+        trained['rf_ranker'] = train_rf_ranker(train_df, hyperparams=rf_hyperparams)
+        print(f"Training gb_ranker...")
+        trained['gb_ranker'] = train_gb_ranker(train_df, hyperparams=gb_hyperparams)
 
-    # --- Evaluate all individual models on test and val sets ---
-    model_results = {}
-    val_results = {}
-    for name, (model, feat_cols) in trained.items():
-        print(f"Evaluating {name} (test)...")
-        model_results[name] = evaluate_ranker(model, test_df, feat_cols)
-        print(f"Evaluating {name} (val)...")
-        val_results[name] = evaluate_ranker(model, val_df, feat_cols)
+        # --- Evaluate all individual models on test and val sets ---
+        model_results = {}
+        val_results = {}
+        for name, (model, feat_cols) in trained.items():
+            print(f"Evaluating {name} (test)...")
+            model_results[name] = evaluate_ranker(model, test_df, feat_cols)
+            print(f"Evaluating {name} (val)...")
+            val_results[name] = evaluate_ranker(model, val_df, feat_cols)
 
-    # --- Ensemble: average normalised scores from all three rankers ---
-    print("Evaluating ensemble (test)...")
-    model_results['ensemble'] = evaluate_ensemble(model_results, test_df)
-    print("Evaluating ensemble (val)...")
-    val_results['ensemble'] = evaluate_ensemble(val_results, val_df)
+        # --- Ensemble: average normalised scores from all three rankers ---
+        print("Evaluating ensemble (test)...")
+        model_results['ensemble'] = evaluate_ensemble(model_results, test_df)
+        print("Evaluating ensemble (val)...")
+        val_results['ensemble'] = evaluate_ensemble(val_results, val_df)
 
-    # Choose best model by 2 Å success rate (tie-break: best-pose selection rate)
-    best_name = max(
-        model_results,
-        key=lambda k: (model_results[k]['xgb_success_2A_rate'],
-                       model_results[k]['xgb_success_rate'])
-    )
-    best_metrics = model_results[best_name]
-    best_model, _ = trained[best_name]
+        # Choose best model by 2 Å success rate (tie-break: best-pose selection rate)
+        best_name = max(
+            model_results,
+            key=lambda k: (model_results[k]['xgb_success_2A_rate'],
+                           model_results[k]['xgb_success_rate'])
+        )
+        best_metrics = model_results[best_name]
+        # 'ensemble' has no single estimator in `trained`; guard against KeyError.
+        best_model = trained[best_name][0] if best_name in trained else None
 
-    # --- Print results ---
-    n_test = best_metrics['total_complexes']
-    n_val  = val_results[best_name]['total_complexes']
-    print(f"\n{'='*60}")
-    print("POSE SELECTION PERFORMANCE")
-    print(f"{'='*60}")
-    print(f"Test complexes : {n_test}   Val complexes : {n_val}")
-    print(f"\nAutoDock Vina (baseline):")
-    print(f"  Best-pose selection rate : "
-          f"val={val_results[best_name]['vina_success_rate']:.3f}  "
-          f"test={best_metrics['vina_success_rate']:.3f}")
-    print(f"  Poses within 2 Å        : "
-          f"val={val_results[best_name]['vina_success_2A_rate']:.3f}  "
-          f"test={best_metrics['vina_success_2A_rate']:.3f}")
-    print(f"  Mean RMSD of selected   : "
-          f"val={val_results[best_name]['mean_vina_rmsd']:.3f}  "
-          f"test={best_metrics['mean_vina_rmsd']:.3f} Å")
-
-    for name, metrics in model_results.items():
-        vm = val_results[name]
-        print(f"\n--- {name} ---")
+        # --- Print results ---
+        n_test = best_metrics['total_complexes']
+        n_val  = val_results[best_name]['total_complexes']
+        print(f"\n{'='*60}")
+        print("POSE SELECTION PERFORMANCE")
+        print(f"{'='*60}")
+        print(f"Test complexes : {n_test}   Val complexes : {n_val}")
+        print(f"\nAutoDock Vina (baseline):")
         print(f"  Best-pose selection rate : "
-              f"val={vm['xgb_success_rate']:.3f}  test={metrics['xgb_success_rate']:.3f}")
+              f"val={val_results[best_name]['vina_success_rate']:.3f}  "
+              f"test={best_metrics['vina_success_rate']:.3f}")
         print(f"  Poses within 2 Å        : "
-              f"val={vm['xgb_success_2A_rate']:.3f}  test={metrics['xgb_success_2A_rate']:.3f}")
-        print(f"  Mean/Median RMSD        : "
-              f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
-              f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å")
-        print(f"  RMSD improvement vs Vina: "
-              f"val={vm['mean_rmsd_improvement']:+.3f}  "
-              f"test={metrics['mean_rmsd_improvement']:+.3f} Å")
-        print(f"  Spearman score–RMSD corr: "
-              f"val={vm['spearman_mean']:.3f}  test={metrics['spearman_mean']:.3f}")
+              f"val={val_results[best_name]['vina_success_2A_rate']:.3f}  "
+              f"test={best_metrics['vina_success_2A_rate']:.3f}")
+        print(f"  Mean RMSD of selected   : "
+              f"val={val_results[best_name]['mean_vina_rmsd']:.3f}  "
+              f"test={best_metrics['mean_vina_rmsd']:.3f} Å")
 
-    print(f"\n{'='*60}")
-    print(f"Best model: {best_name}")
-
-    # --- Save performance metrics ---
-    metrics_file = OUTPUT_DIR / 'pose_selection_metrics.txt'
-    with open(metrics_file, 'w') as f:
-        f.write("=" * 60 + "\n")
-        f.write("POSE SELECTION PERFORMANCE METRICS\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Val complexes : {n_val}   Test complexes : {n_test}\n\n")
-        f.write("AutoDock Vina (baseline):\n")
-        _bv = val_results[best_name]
-        f.write(f"  Best-pose selection rate : "
-                f"val={_bv['vina_success_rate']:.3f}  "
-                f"test={best_metrics['vina_success_rate']:.3f}\n")
-        f.write(f"  Poses within 2 Å        : "
-                f"val={_bv['vina_success_2A_rate']:.3f}  "
-                f"test={best_metrics['vina_success_2A_rate']:.3f}\n")
-        f.write(f"  Mean RMSD               : "
-                f"val={_bv['mean_vina_rmsd']:.3f}  "
-                f"test={best_metrics['mean_vina_rmsd']:.3f} Å\n\n")
         for name, metrics in model_results.items():
             vm = val_results[name]
-            f.write(f"{name}{'  <-- best' if name == best_name else ''}:\n")
+            print(f"\n--- {name} ---")
+            print(f"  Best-pose selection rate : "
+                  f"val={vm['xgb_success_rate']:.3f}  test={metrics['xgb_success_rate']:.3f}")
+            print(f"  Poses within 2 Å        : "
+                  f"val={vm['xgb_success_2A_rate']:.3f}  test={metrics['xgb_success_2A_rate']:.3f}")
+            print(f"  Mean/Median RMSD        : "
+                  f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
+                  f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å")
+            print(f"  RMSD improvement vs Vina: "
+                  f"val={vm['mean_rmsd_improvement']:+.3f}  "
+                  f"test={metrics['mean_rmsd_improvement']:+.3f} Å")
+            print(f"  Spearman score–RMSD corr: "
+                  f"val={vm['spearman_mean']:.3f}  test={metrics['spearman_mean']:.3f}")
+
+        print(f"\n{'='*60}")
+        print(f"Best model: {best_name}")
+
+        # --- Save performance metrics ---
+        metrics_file = OUTPUT_DIR / 'pose_selection_metrics.txt'
+        with open(metrics_file, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("POSE SELECTION PERFORMANCE METRICS\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Val complexes : {n_val}   Test complexes : {n_test}\n\n")
+            f.write("AutoDock Vina (baseline):\n")
+            _bv = val_results[best_name]
             f.write(f"  Best-pose selection rate : "
-                    f"val={vm['xgb_success_rate']:.3f}  "
-                    f"test={metrics['xgb_success_rate']:.3f}\n")
+                    f"val={_bv['vina_success_rate']:.3f}  "
+                    f"test={best_metrics['vina_success_rate']:.3f}\n")
             f.write(f"  Poses within 2 Å        : "
-                    f"val={vm['xgb_success_2A_rate']:.3f}  "
-                    f"test={metrics['xgb_success_2A_rate']:.3f}\n")
-            f.write(f"  Mean/Median RMSD        : "
-                    f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
-                    f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å\n")
-            f.write(f"  RMSD improvement vs Vina: "
-                    f"val={vm['mean_rmsd_improvement']:+.3f}  "
-                    f"test={metrics['mean_rmsd_improvement']:+.3f} Å\n")
-            f.write(f"  Spearman score-RMSD corr: "
-                    f"val={vm['spearman_mean']:.3f}  "
-                    f"test={metrics['spearman_mean']:.3f}\n\n")
+                    f"val={_bv['vina_success_2A_rate']:.3f}  "
+                    f"test={best_metrics['vina_success_2A_rate']:.3f}\n")
+            f.write(f"  Mean RMSD               : "
+                    f"val={_bv['mean_vina_rmsd']:.3f}  "
+                    f"test={best_metrics['mean_vina_rmsd']:.3f} Å\n\n")
+            for name, metrics in model_results.items():
+                vm = val_results[name]
+                f.write(f"{name}{'  <-- best' if name == best_name else ''}:\n")
+                f.write(f"  Best-pose selection rate : "
+                        f"val={vm['xgb_success_rate']:.3f}  "
+                        f"test={metrics['xgb_success_rate']:.3f}\n")
+                f.write(f"  Poses within 2 Å        : "
+                        f"val={vm['xgb_success_2A_rate']:.3f}  "
+                        f"test={metrics['xgb_success_2A_rate']:.3f}\n")
+                f.write(f"  Mean/Median RMSD        : "
+                        f"val={vm['mean_xgb_rmsd']:.3f}/{vm['median_xgb_rmsd']:.3f}  "
+                        f"test={metrics['mean_xgb_rmsd']:.3f}/{metrics['median_xgb_rmsd']:.3f} Å\n")
+                f.write(f"  RMSD improvement vs Vina: "
+                        f"val={vm['mean_rmsd_improvement']:+.3f}  "
+                        f"test={metrics['mean_rmsd_improvement']:+.3f} Å\n")
+                f.write(f"  Spearman score-RMSD corr: "
+                        f"val={vm['spearman_mean']:.3f}  "
+                        f"test={metrics['spearman_mean']:.3f}\n\n")
 
-    print(f"Saved metrics to {metrics_file}")
+        print(f"Saved metrics to {metrics_file}")
 
-    # --- Export per-pose score comparison CSV ---
-    print("\nExporting score comparison CSV...")
-    export_score_comparison_csv(model_results, OUTPUT_DIR)
+        # --- Export per-pose score comparison CSV ---
+        print("\nExporting score comparison CSV...")
+        export_score_comparison_csv(model_results, OUTPUT_DIR)
 
-    # --- Export detailed pose scores CSV (best model) ---
-    print("\nExporting detailed pose scores...")
-    if args.load_csv:
-        vina_results_for_export = []
-    else:
-        test_complexes_list = test_df['pdb_code'].unique()
-        vina_results_for_export = [vr for vr in vina_results if vr['pdb_code'] in test_complexes_list]
+        # --- Export detailed pose scores CSV (best model) ---
+        print("\nExporting detailed pose scores...")
+        if args.load_csv:
+            vina_results_for_export = []
+        else:
+            test_complexes_list = test_df['pdb_code'].unique()
+            vina_results_for_export = [vr for vr in vina_results if vr['pdb_code'] in test_complexes_list]
 
-    export_pose_scores_csv(best_metrics['test_df'], vina_results_for_export, OUTPUT_DIR)
+        export_pose_scores_csv(best_metrics['test_df'], vina_results_for_export, OUTPUT_DIR)
 
-    # --- Generate plots (best model) ---
-    if not args.no_plots:
-        print("\nGenerating visualization plots...")
-        try:
-            feature_cols = [col for col in test_df.columns
-                            if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
+        # --- Generate plots (best model) ---
+        if not args.no_plots:
+            print("\nGenerating visualization plots...")
+            try:
+                feature_cols = [col for col in test_df.columns
+                                if col not in ['pdb_code', 'pose_idx', 'is_best_pose', 'rmsd', 'predicted_proba']]
 
-            plot_rmsd_distribution_comparison(best_metrics, OUTPUT_DIR)
-            plot_success_rate_by_rank(best_metrics, best_metrics['test_df'], OUTPUT_DIR)
-            plot_feature_importance(best_model, feature_cols, OUTPUT_DIR)
-            plot_rmsd_vs_probability(best_metrics['test_df'], OUTPUT_DIR)
+                plot_rmsd_distribution_comparison(best_metrics, OUTPUT_DIR)
+                plot_success_rate_by_rank(best_metrics, best_metrics['test_df'], OUTPUT_DIR)
+                if best_model is not None:
+                    plot_feature_importance(best_model, feature_cols, OUTPUT_DIR)
+                plot_rmsd_vs_probability(best_metrics['test_df'], OUTPUT_DIR)
 
-            # New diagnostic plots (all models shown together)
-            plot_success_vs_rmsd_threshold(model_results, OUTPUT_DIR)
-            plot_rmsd_cdf(model_results, OUTPUT_DIR)
-            plot_spearman_per_complex(model_results, OUTPUT_DIR)
+                # New diagnostic plots (all models shown together)
+                plot_success_vs_rmsd_threshold(model_results, OUTPUT_DIR)
+                plot_rmsd_cdf(model_results, OUTPUT_DIR)
+                plot_spearman_per_complex(model_results, OUTPUT_DIR)
 
-            print("\nAll plots saved successfully!")
-        except Exception as e:
-            print(f"\nWarning: Could not generate some plots: {e}")
-            import traceback
-            traceback.print_exc()
+                print("\nAll plots saved successfully!")
+            except Exception as e:
+                print(f"\nWarning: Could not generate some plots: {e}")
+                import traceback
+                traceback.print_exc()
 
     # ================================================================
     # --- Binding affinity prediction (rank-1 pose → ΔG regression) ---
@@ -4089,6 +4151,20 @@ def main():
                             (OUTPUT_DIR / 'svr_affinity_fp_pose_metadata.json').write_text(
                                 json.dumps(svr_pose_meta, indent=2))
                             print(f"Saved pose-aware SVR+fp model to {svr_pose_path}")
+
+                            # ---- Evaluate on test set (rank-1 Vina pose per complex) ----
+                            print("\nEvaluating pose-aware SVR+fp on test set "
+                                  "(rank-1 Vina pose vs experimental ΔG)...")
+                            pa_metrics = evaluate_pose_aware_svr_fp(
+                                svr_pose_pipe, test_df_aff,
+                                pose_feature_cols=pose_feature_cols_pa,
+                                fp_n_bits=2048,
+                            )
+                            print(f"  Complexes scored : {pa_metrics['n']}")
+                            print(f"  Pearson r        : {pa_metrics['pearson_r']:+.3f}")
+                            print(f"  Spearman r       : {pa_metrics['spearman_r']:+.3f}")
+                            print(f"  RMSE             : {pa_metrics['rmse']:.3f} kcal/mol")
+                            print(f"  MAE              : {pa_metrics['mae']:.3f} kcal/mol")
     else:
         print("\nSkipping affinity prediction (--no-affinity set).")
 

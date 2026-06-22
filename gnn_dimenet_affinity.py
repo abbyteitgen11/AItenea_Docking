@@ -62,6 +62,7 @@ from process_pdbind import (  # noqa: E402
     join_affinity_labels,
     prepare_affinity_data,
     split_val_from_train,
+    get_complex_path,
     STRUCTURES_DIR,
     OUTPUT_DIR,
     RANDOM_SEED,
@@ -162,7 +163,10 @@ class LigandDataset3D(InMemoryDataset):
             print("  Run process_pdbind.py with --augment to compute contact features.")
 
         for row in aff_df.itertuples(index=False):
-            mol2_path = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
+            try:
+                mol2_path = get_complex_path(row.pdb_code) / f"{row.pdb_code}_ligand.mol2"
+            except FileNotFoundError:
+                mol2_path = STRUCTURES_DIR / row.pdb_code / f"{row.pdb_code}_ligand.mol2"
             mol = None
             if mol2_path.exists():
                 mol = Chem.MolFromMol2File(str(mol2_path), removeHs=True)

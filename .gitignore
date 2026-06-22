@@ -9,6 +9,9 @@ PDBind_2020_index/
 CASF-2016/
 AGENTS.md
 plan.md
+checkpoints/
+output_remaining_complexes/
+remaining_complexes/
 *.log
 *.tar.gz
 *.gz
